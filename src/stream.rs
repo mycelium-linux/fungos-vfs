@@ -493,7 +493,7 @@ where
     let Some(snapshot) = batch.snapshot else {
         // The delta path, unchanged: the same value the whole-message carrier
         // builds, over the same framing it always had, in one frame.
-        let response = vfs.pack_content(batch)?;
+        let response = vfs.pack_content(batch, true)?;
         let entries = response.ops.len() as u64;
         let content_bytes: u64 = response
             .content
@@ -684,7 +684,7 @@ mod tests {
         a.put("seed.md", b"seed", "text/markdown", Expect::Any)
             .unwrap();
         let batch = a.answer_sync(&b.sync_cursor().unwrap(), 100).unwrap();
-        let response = a.pack_content(batch).unwrap();
+        let response = a.pack_content(batch, true).unwrap();
         b.apply_sync(&response).unwrap();
 
         for index in 0..count {

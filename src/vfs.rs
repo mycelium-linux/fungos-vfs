@@ -160,6 +160,17 @@ pub struct SyncOp {
     pub store: String,
     /// Total order across writers, not just within one.
     pub hlc: Hlc,
+    /// How large the file is, when the sender knew.
+    ///
+    /// A receiver told not to take bytes still writes an entry, and an entry
+    /// without a size is a file whose length nobody can state until it is
+    /// fetched. Optional on the wire because a peer that predates it sends
+    /// neither this nor `media_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// What kind of file it is, when the sender knew. Same reasoning as `size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
     /// The head this write replaced, when the write produced content.
     ///
     /// Without it a peer can see that a path changed, but not what the writer
@@ -1933,6 +1944,8 @@ impl Vfs {
                     counter: row.get::<_, i64>(9)? as u32,
                 },
                 base_content_id: row.get::<_, Option<String>>(10)?.map(ContentId),
+                size: None,
+                media_type: None,
                 worktree: row.get(11)?,
                 store: row.get(12)?,
             })

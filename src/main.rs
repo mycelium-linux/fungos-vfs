@@ -184,6 +184,11 @@ enum Command {
         /// The peer's `fungos-vfs` binary.
         #[arg(long, default_value = "fungos-vfs")]
         remote_bin: String,
+        /// Whether to take the bytes as well as the names: `all` (default) or
+        /// `none`, which leaves entries as placeholders to be fetched when a
+        /// file is actually opened.
+        #[arg(long, default_value = "all")]
+        content: String,
         /// The role the peer opens its root as, when it differs from this end's.
         /// A full store pulling from a laptop's cache copy is the ordinary case.
         #[arg(long)]
@@ -651,6 +656,7 @@ fn run() -> anyhow::Result<()> {
             remote_root,
             remote_bin,
             remote_role,
+            content,
             limit,
             older_than,
             quic,
@@ -715,6 +721,7 @@ fn run() -> anyhow::Result<()> {
                             &remote_root,
                             &remote_bin,
                             remote_role.as_deref(),
+                            content != "none",
                             limit,
                         )?
                     }
