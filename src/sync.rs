@@ -693,7 +693,9 @@ impl Vfs {
             &op.path,
             content_id.clone(),
             op.size.unwrap_or(0),
-            op.media_type.as_deref().unwrap_or("application/octet-stream"),
+            op.media_type
+                .as_deref()
+                .unwrap_or("application/octet-stream"),
         )?;
         Ok(ApplyOutcome::Applied)
     }
