@@ -184,6 +184,10 @@ enum Command {
         /// The peer's `fungos-vfs` binary.
         #[arg(long, default_value = "fungos-vfs")]
         remote_bin: String,
+        /// The role the peer opens its root as, when it differs from this end's.
+        /// A full store pulling from a laptop's cache copy is the ordinary case.
+        #[arg(long)]
+        remote_role: Option<String>,
         #[arg(long, default_value_t = 500)]
         limit: usize,
         /// How old, in seconds, a log row must be before `compact` drops it.
@@ -646,6 +650,7 @@ fn run() -> anyhow::Result<()> {
             remote,
             remote_root,
             remote_bin,
+            remote_role,
             limit,
             older_than,
             quic,
@@ -704,7 +709,14 @@ fn run() -> anyhow::Result<()> {
                             remote.ok_or_else(|| anyhow::anyhow!("sync pull needs --remote"))?;
                         let remote_root = remote_root
                             .ok_or_else(|| anyhow::anyhow!("sync pull needs --remote-root"))?;
-                        pull_over_ssh(&mut vfs, &remote, &remote_root, &remote_bin, limit)?
+                        pull_over_ssh(
+                            &mut vfs,
+                            &remote,
+                            &remote_root,
+                            &remote_bin,
+                            remote_role.as_deref(),
+                            limit,
+                        )?
                     }
                 };
                 println!("{}", summarize(&outcomes, &report));
