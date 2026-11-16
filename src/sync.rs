@@ -1242,13 +1242,21 @@ pub fn pull_over_ssh(
     remote: &str,
     remote_root: &str,
     remote_bin: &str,
+    remote_role: Option<&str>,
     limit: usize,
 ) -> Result<(Vec<ApplyOutcome>, TransferReport), VfsError> {
     let request = SyncRequest::new(vfs.sync_cursor()?, limit);
+    // The peer opens its root in the role that root was created with, and the
+    // two ends do not have to agree: a full store pulling from a laptop's cache
+    // copy is the ordinary case, and it fails if both are told `full`.
+    let role = remote_role
+        .map(|role| format!(" --role {}", shell_quote(role)))
+        .unwrap_or_default();
     let command = format!(
-        "{} --root {} sync serve",
+        "{} --root {} sync serve{}",
         remote_bin,
-        shell_quote(remote_root)
+        shell_quote(remote_root),
+        role
     );
     let mut child = ssh_command()
         .arg(remote)
