@@ -416,8 +416,7 @@ impl Transcript {
                 }
                 None => {
                     // Header blocks take the low slots, turns start above them.
-                    let id = if u64::try_from(index).is_ok_and(|slot| slot < Self::HEADER_SLOTS)
-                    {
+                    let id = if u64::try_from(index).is_ok_and(|slot| slot < Self::HEADER_SLOTS) {
                         BlockId::new(u64::try_from(index).unwrap_or(0), &author)
                     } else {
                         fresh()
@@ -1140,7 +1139,10 @@ mod tests {
         assert_ne!(first, Transcript::block_id(author, 4, 0, &mut fallback));
         assert!(first.counter > Transcript::HEADER_SLOTS);
         // An actor still namespaces it, so two records cannot collide.
-        assert_ne!(first, Transcript::block_id("pi:ffffffff", 3, 0, &mut fallback));
+        assert_ne!(
+            first,
+            Transcript::block_id("pi:ffffffff", 3, 0, &mut fallback)
+        );
     }
 
     #[test]

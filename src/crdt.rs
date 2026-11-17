@@ -27,6 +27,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::text::{Text, TextOp};
+
 /// Who an edit is attributed to. The actor is part of every identity, so two
 /// machines generate the same counter without colliding.
 ///
@@ -90,6 +92,15 @@ pub enum Op {
         text: String,
         at: BlockId,
     },
+    /// A block's content edited character by character.
+    ///
+    /// This is what a save emits now: [`crate::text`] merges the characters, so two
+    /// replicas editing different parts of one paragraph both keep their edit
+    /// instead of one winning the whole block. `Update` remains as the wholesale
+    /// replacement — a projector re-rendering a turn, an import that found no
+    /// shared base — and it clears the character state, because a block whose text
+    /// was replaced has no characters in common with what it was.
+    Edit { id: BlockId, ops: Vec<TextOp> },
     /// A block removed. It stays in the tree as a tombstone.
     Delete { id: BlockId, at: BlockId },
 }
@@ -103,6 +114,13 @@ pub struct Block {
     pub text: String,
     /// The stamp of the last write to `text`.
     pub revision: BlockId,
+    /// The block's text as characters with identities, so an edit merges inside a
+    /// paragraph instead of replacing it. Empty on a block written by a build that
+    /// predates it, and seeded from `text` the first time an edit arrives — the
+    /// seed is derived from the block's identity, so every replica seeds the same
+    /// characters.
+    #[serde(default, skip_serializing_if = "Text::is_empty")]
+    pub chars: Text,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deleted: bool,
 }
@@ -178,6 +196,7 @@ impl Doc {
                     Block {
                         id: id.clone(),
                         after: after.clone(),
+                        chars: Text::seeded(id, text),
                         text: text.clone(),
                         revision: id.clone(),
                         deleted: false,
@@ -194,11 +213,36 @@ impl Doc {
                     return Applied::Duplicate;
                 }
                 block.text.clone_from(text);
+                // Replaced wholesale: the characters it had are not the characters
+                // it has, so the next edit seeds from the new text rather than
+                // merging into a stale sequence.
+                block.chars = Text::seeded(id, text);
                 // A write that wins is a write: it also brings a block back if the
                 // side it is racing deleted it. Last writer wins, including deletes.
                 block.deleted = false;
                 block.revision = at.clone();
                 Applied::Applied
+            }
+            Op::Edit { id, ops } => {
+                let Some(block) = self.blocks.get_mut(id) else {
+                    return Applied::Deferred;
+                };
+                if block.chars.is_empty() {
+                    block.chars = Text::seeded(id, &block.text);
+                }
+                // Character ops carry their own order, so there is no stamp to
+                // compare and nothing to lose: this merges, it does not win.
+                let deferred = block.chars.apply_all(ops);
+                block.text = block.chars.render();
+                block.deleted = false;
+                if deferred.is_empty() {
+                    Applied::Applied
+                } else {
+                    // Anchored to a character this replica has not seen. The op is
+                    // retried when the rest of the stream arrives, and applying it
+                    // twice is a duplicate.
+                    Applied::Deferred
+                }
             }
             Op::Delete { id, at } => {
                 self.observe(at.counter);
@@ -338,6 +382,29 @@ impl Doc {
         self.len() == 0
     }
 
+    /// The ops that turn one block's text into another's, character by character.
+    ///
+    /// A rewritten paragraph is a few inserted and deleted characters, not a new
+    /// paragraph: that is what lets two replicas that edited different sentences of
+    /// it both keep their sentence. `None` when the text did not change.
+    fn edit(&mut self, id: &BlockId, have: &str, want: &str) -> Option<Op> {
+        let (start, removed, inserted) = Text::difference(have, want);
+        if removed == 0 && inserted.is_empty() {
+            return None;
+        }
+        let mut text = self
+            .blocks
+            .get(id)
+            .map(|block| block.chars.clone())
+            .filter(|chars| !chars.is_empty())
+            .unwrap_or_else(|| Text::seeded(id, have));
+        let ops = text.splice(start, removed, &inserted, &mut || self.tick());
+        Some(Op::Edit {
+            id: id.clone(),
+            ops,
+        })
+    }
+
     /// Turn a file's contents into ops, against what this replica already holds.
     ///
     /// This is the seam that lets a plain editor — or an agent's `write` tool — be
@@ -377,12 +444,13 @@ impl Doc {
             let mut old_index = old_cursor;
             let mut new_index = new_cursor;
             while old_index < old_match && new_index < new_match {
-                let at = self.tick();
-                ops.push(Op::Update {
-                    id: current[old_index].0.clone(),
-                    text: incoming[new_index].clone(),
-                    at,
-                });
+                if let Some(edit) = self.edit(
+                    &current[old_index].0,
+                    &current[old_index].1,
+                    &incoming[new_index],
+                ) {
+                    ops.push(edit);
+                }
                 last_placed = Some(current[old_index].0.clone());
                 old_index += 1;
                 new_index += 1;
@@ -600,7 +668,11 @@ mod tests {
 
         let ops = doc.import(&BASE.replace("first", "the first"));
         assert_eq!(ops.len(), 1, "one rewrite, not a delete plus an insert");
-        assert!(matches!(ops[0], Op::Update { .. }));
+        assert!(
+            matches!(ops[0], Op::Edit { .. }),
+            "a save is characters, not a whole-block replacement: {:?}",
+            ops[0]
+        );
         doc.apply_all(&ops);
 
         assert_eq!(doc.live()[1].id, before);
@@ -620,9 +692,37 @@ mod tests {
     }
 
     #[test]
-    fn two_edits_to_one_block_resolve_by_stamp() {
-        // Inside a block the rule is last-writer-wins until a text CRDT replaces
-        // it. What matters now is that both replicas pick the same winner.
+    fn two_edits_inside_one_block_both_survive() {
+        // The rule this replaces: inside a block, last writer won and one edit was
+        // lost. Now the characters merge, so a person on each machine keeps what
+        // they typed even when both touched the same paragraph.
+        let mut neo = Doc::new("neo");
+        let base = neo.import(BASE);
+        neo.apply_all(&base);
+        let mut studio = replica("studio", &base);
+
+        let neo_ops = neo.import(&BASE.replace("first", "NEO"));
+        neo.apply_all(&neo_ops);
+        // A different sentence of the same block, not the same word.
+        let studio_ops = studio.import(&BASE.replace("second", "STUDIO"));
+        studio.apply_all(&studio_ops);
+
+        neo.apply_all(&studio_ops);
+        studio.apply_all(&neo_ops);
+
+        assert_eq!(neo.render(), studio.render());
+        let text = neo.render();
+        assert!(text.contains("NEO"), "the first edit survived: {text}");
+        assert!(text.contains("STUDIO"), "the second edit survived: {text}");
+        assert_eq!(neo.len(), 3, "still one block per paragraph");
+    }
+
+    #[test]
+    fn the_same_word_edited_twice_leaves_both_versions_visible() {
+        // The honest edge of a character CRDT: two people typing over the *same*
+        // characters do not overwrite each other, they concatenate. That is a
+        // different outcome from last-writer-wins, not a better one, and it has to
+        // be stated so nobody reads it as a lost edit.
         let mut neo = Doc::new("neo");
         let base = neo.import(BASE);
         neo.apply_all(&base);
@@ -632,17 +732,15 @@ mod tests {
         neo.apply_all(&neo_ops);
         let studio_ops = studio.import(&BASE.replace("first", "STUDIO"));
         studio.apply_all(&studio_ops);
-
         neo.apply_all(&studio_ops);
         studio.apply_all(&neo_ops);
 
-        assert_eq!(neo.render(), studio.render());
+        assert_eq!(neo.render(), studio.render(), "both replicas agree");
         let text = neo.render();
         assert!(
-            text.contains("NEO") ^ text.contains("STUDIO"),
-            "exactly one side wins the block: {text}"
+            text.contains("NEO") && text.contains("STUDIO"),
+            "concurrent replacement of one word keeps both: {text}"
         );
-        assert!(!text.contains("first paragraph"));
     }
 
     #[test]
