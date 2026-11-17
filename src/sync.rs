@@ -125,6 +125,11 @@ fn message_version() -> u16 {
     MESSAGE_VERSION
 }
 
+/// The default for a peer that predates `content`: it wants the bytes.
+fn wants_content() -> bool {
+    true
+}
+
 /// A sync request, as it travels.
 ///
 /// The wire is deliberately plain: a carrier only has to move these bytes, so
@@ -137,6 +142,15 @@ pub struct SyncRequest {
     pub version: u16,
     pub cursor: SyncCursor,
     pub limit: usize,
+    /// Whether the answer should carry the bytes its ops name.
+    ///
+    /// A machine that is going to read everything it holds wants them. One that
+    /// holds a copy it may never open wants the names and sizes, so the entry
+    /// can be a placeholder and the bytes can be asked for when a file is
+    /// actually touched. Defaults to `true` so a peer that has never heard of
+    /// this field keeps getting what it always got.
+    #[serde(default = "wants_content")]
+    pub content: bool,
 }
 
 impl SyncRequest {
@@ -145,6 +159,7 @@ impl SyncRequest {
             version: MESSAGE_VERSION,
             cursor,
             limit,
+            content: true,
         }
     }
 }
@@ -433,7 +448,7 @@ impl Vfs {
             )));
         }
         let batch = self.answer_sync(&request.cursor, request.limit)?;
-        self.pack_content(batch)
+        self.pack_content(batch, request.content)
     }
 
     /// Attach the bytes a batch names, each blob once.
@@ -441,11 +456,36 @@ impl Vfs {
     /// One blob may serve several paths, and a snapshot names every path it
     /// has: sending the same bytes twice would make the answer grow with
     /// the namespace rather than with the content in it.
-    pub(crate) fn pack_content(&self, batch: SyncBatch) -> Result<SyncResponse, VfsError> {
+    pub(crate) fn pack_content(
+        &self,
+        batch: SyncBatch,
+        with_content: bool,
+    ) -> Result<SyncResponse, VfsError> {
+        // Every op leaves with the size and media type of the path it names, so
+        // a receiver that was told not to take the bytes can still write an
+        // entry that describes the file it will hydrate later.
+        let SyncBatch {
+            mut ops,
+            snapshot,
+            missing_content: _,
+        } = batch;
+        for op in &mut ops {
+            if let Ok(Some(entry)) = self.file(&op.path) {
+                op.size = Some(entry.size);
+                op.media_type = Some(entry.media_type);
+            }
+        }
+        if !with_content {
+            return Ok(SyncResponse {
+                ops,
+                snapshot,
+                content: Vec::new(),
+            });
+        }
         let content = {
             let mut wanted: BTreeSet<&ContentId> = BTreeSet::new();
-            wanted.extend(batch.ops.iter().filter_map(|op| op.content_id.as_ref()));
-            if let Some(snapshot) = &batch.snapshot {
+            wanted.extend(ops.iter().filter_map(|op| op.content_id.as_ref()));
+            if let Some(snapshot) = &snapshot {
                 wanted.extend(
                     snapshot
                         .entries
@@ -465,8 +505,8 @@ impl Vfs {
             content
         };
         Ok(SyncResponse {
-            ops: batch.ops,
-            snapshot: batch.snapshot,
+            ops,
+            snapshot,
             content,
         })
     }
@@ -476,6 +516,21 @@ impl Vfs {
     /// A response that carries a snapshot yields a single `Snapshot` outcome
     /// and no per-op outcomes: the state was replaced, not replayed.
     pub fn apply_sync(&mut self, response: &SyncResponse) -> Result<Vec<ApplyOutcome>, VfsError> {
+        self.apply_sync_with(response, false)
+    }
+
+    /// Apply a response, writing placeholders for ops whose bytes were not sent.
+    ///
+    /// A peer that asked for names without content gets entries it can list,
+    /// stat and later `fetch`. `apply_sync` refuses that response; this is the
+    /// call that accepts it, and it is a separate name because accepting it is
+    /// a choice: a store that promised to hold bytes should not quietly hold
+    /// names instead.
+    pub fn apply_sync_with(
+        &mut self,
+        response: &SyncResponse,
+        placeholders: bool,
+    ) -> Result<Vec<ApplyOutcome>, VfsError> {
         let mut blobs = BTreeMap::new();
         for blob in &response.content {
             blobs.insert(blob.id.clone(), blob.decode()?);
@@ -491,6 +546,10 @@ impl Vfs {
                 .as_ref()
                 .and_then(|id| blobs.get(&id.to_string()))
                 .map(Vec::as_slice);
+            if bytes.is_none() && placeholders {
+                outcomes.push(self.apply_placeholder_op(op)?);
+                continue;
+            }
             outcomes.push(self.apply_remote(op, bytes)?);
         }
         Ok(outcomes)
@@ -592,6 +651,53 @@ impl Vfs {
             missing_content,
             snapshot: None,
         })
+    }
+
+    /// Apply one remote op whose bytes were deliberately not sent.
+    ///
+    /// The entry is written as a placeholder: the path, the content id it will
+    /// hydrate from, and the size and media type the sender stated. A file the
+    /// receiver has not fetched is still a file it can list and describe, which
+    /// is the whole difference between a copy that costs disk and one that costs
+    /// a row.
+    ///
+    /// Divergence is still refused, and still recorded — but with no bytes to
+    /// keep, so a later resolution can take the newer write or ask for the
+    /// content again; it cannot hand back the losing version it never had.
+    fn apply_placeholder_op(&mut self, op: &crate::SyncOp) -> Result<ApplyOutcome, VfsError> {
+        if self
+            .horizons()?
+            .get(&op.store)
+            .is_some_and(|horizon| *horizon >= op.hlc)
+        {
+            return Ok(ApplyOutcome::Duplicate);
+        }
+        if self.mark_applied(&op.store, op.hlc)? == 0 {
+            return Ok(ApplyOutcome::Duplicate);
+        }
+        if !matches!(op.kind, SyncOpKind::Upsert) {
+            // A removal, a directory: nothing to hold bytes for.
+            return self.apply_remote(op, None);
+        }
+        let content_id = op
+            .content_id
+            .as_ref()
+            .ok_or_else(|| VfsError::InvalidContentId(op.path.clone()))?;
+        let current = self.file(&op.path)?;
+        let current_id = current.as_ref().map(|entry| &entry.content_id);
+        if current_id != op.base_content_id.as_ref() {
+            self.mark_diverged(&op.store, op.hlc, &op.path, &[], &op.actor, &op.origin)?;
+            return Ok(ApplyOutcome::Diverged);
+        }
+        self.register_placeholder(
+            &op.path,
+            content_id.clone(),
+            op.size.unwrap_or(0),
+            op.media_type
+                .as_deref()
+                .unwrap_or("application/octet-stream"),
+        )?;
+        Ok(ApplyOutcome::Applied)
     }
 
     /// Apply one remote op, with its bytes if the op carries content.
@@ -1242,13 +1348,23 @@ pub fn pull_over_ssh(
     remote: &str,
     remote_root: &str,
     remote_bin: &str,
+    remote_role: Option<&str>,
+    want_content: bool,
     limit: usize,
 ) -> Result<(Vec<ApplyOutcome>, TransferReport), VfsError> {
-    let request = SyncRequest::new(vfs.sync_cursor()?, limit);
+    let mut request = SyncRequest::new(vfs.sync_cursor()?, limit);
+    request.content = want_content;
+    // The peer opens its root in the role that root was created with, and the
+    // two ends do not have to agree: a full store pulling from a laptop's cache
+    // copy is the ordinary case, and it fails if both are told `full`.
+    let role = remote_role
+        .map(|role| format!(" --role {}", shell_quote(role)))
+        .unwrap_or_default();
     let command = format!(
-        "{} --root {} sync serve",
+        "{} --root {} sync serve{}",
         remote_bin,
-        shell_quote(remote_root)
+        shell_quote(remote_root),
+        role
     );
     let mut child = ssh_command()
         .arg(remote)
@@ -1294,7 +1410,7 @@ pub fn pull_over_ssh(
         resumed_from: 0,
         attempts: 1,
     };
-    let outcomes = vfs.apply_sync(&response)?;
+    let outcomes = vfs.apply_sync_with(&response, !want_content)?;
     Ok((outcomes, report))
 }
 

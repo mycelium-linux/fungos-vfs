@@ -82,8 +82,11 @@ impl KuboHydrator {
     fn block_get(&self, cid: &str) -> Result<Vec<u8>, VfsError> {
         let response = self
             .client
+            // `offline`: a replica is a copy, and asking its node to go
+            // looking on the swarm turns a missing block into a wait that
+            // never answers. Local-only is the honest question here.
             .post(format!("{}/api/v0/block/get", self.api))
-            .query(&[("arg", cid)])
+            .query(&[("arg", cid), ("offline", "true")])
             .send()
             .map_err(|error| VfsError::Transport(format!("kubo block/get {cid}: {error}")))?;
 
@@ -154,8 +157,10 @@ impl KuboReplica {
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_default()
+            // Same reasoning as `block/get`: "is it here" is a question about
+            // this node's blockstore, not the network.
             .post(format!("{}/api/v0/block/stat", self.api))
-            .query(&[("arg", cid.as_str())])
+            .query(&[("arg", cid.as_str()), ("offline", "true")])
             .send()
             .map_err(|error| VfsError::Transport(format!("kubo block/stat {cid}: {error}")))?;
         match response.status().as_u16() {
@@ -163,10 +168,21 @@ impl KuboReplica {
             // A node that has never seen the block says so with a 4xx, and that
             // is an answer rather than a failure.
             400..=499 => Ok(false),
-            _ => Err(VfsError::Transport(format!(
-                "kubo block/stat {cid}: HTTP {}",
-                response.status()
-            ))),
+            // Kubo answers a missing block with 500 and a message rather than a
+            // 404: to it, a blockstore miss is an error. Read the body before
+            // calling it one.
+            _ => {
+                let status = response.status();
+                let body = response.text().unwrap_or_default();
+                if body.contains("not found") || body.contains("could not find") {
+                    Ok(false)
+                } else {
+                    Err(VfsError::Transport(format!(
+                        "kubo block/stat {cid}: HTTP {status}: {}",
+                        body.trim()
+                    )))
+                }
+            }
         }
     }
 }
