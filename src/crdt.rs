@@ -231,13 +231,19 @@ impl Doc {
     pub fn apply_all(&mut self, ops: &[Op]) -> Vec<Op> {
         let mut pending: Vec<&Op> = ops.iter().collect();
         loop {
+            // The size of *this* pass, not of the batch that started it: an op that
+            // lands leaves the retry list shorter, and comparing against the
+            // original length means a pass that defers everything it was given can
+            // never look finished. That was an infinite loop, reached by any pull
+            // that resumed holding only ops whose block had not arrived yet.
+            let count = pending.len();
             let mut deferred = Vec::new();
             for op in pending {
                 if self.apply(op) == Applied::Deferred {
                     deferred.push(op);
                 }
             }
-            if deferred.is_empty() || deferred.len() == ops.len() {
+            if deferred.is_empty() || deferred.len() == count {
                 return deferred.into_iter().cloned().collect();
             }
             pending = deferred;
@@ -543,6 +549,34 @@ mod tests {
             text.find("edited").unwrap() < text.find("third").unwrap(),
             "the edit stays where it was and the addition stays at the end: {text}"
         );
+    }
+
+    #[test]
+    fn a_batch_whose_remaining_ops_all_defer_terminates() {
+        // A pull can resume mid-stream, so a batch may arrive holding only ops that
+        // wait on a block the next pull carries. Every op that lands shortens the
+        // retry list; when a whole pass lands nothing, the rest is waiting on a
+        // block that is not here and the batch is done.
+        let mut doc = Doc::new("neo");
+        let batch = vec![
+            Op::Update {
+                id: BlockId::new(99, "ghost"),
+                text: "never lands".to_owned(),
+                at: BlockId::new(100, "ghost"),
+            },
+            Op::Delete {
+                id: BlockId::new(98, "ghost"),
+                at: BlockId::new(101, "ghost"),
+            },
+            Op::Insert {
+                id: BlockId::new(1, "neo"),
+                after: None,
+                text: "here".to_owned(),
+            },
+        ];
+        let deferred = doc.apply_all(&batch);
+        assert_eq!(deferred.len(), 2, "only the insert could land");
+        assert_eq!(doc.render(), "here");
     }
 
     #[test]

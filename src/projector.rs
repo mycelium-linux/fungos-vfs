@@ -310,6 +310,38 @@ pub struct Synced {
 }
 
 impl Transcript {
+    /// Counter space a transcript's blocks live in.
+    ///
+    /// A block's identity here is derived from *what it is* — the header, or turn
+    /// `t`'s `j`-th block — and never from how many blocks this replica happened to
+    /// write before it. Handing out counters in sync order makes identity depend on
+    /// history instead: two machines that synced the same session from different
+    /// depths, or that disagree about how many blocks one turn renders because one
+    /// of them imported an incomplete turn, produce different ids for one turn —
+    /// and a merge then shows it twice, or worse, collapses two turns onto one id.
+    ///
+    /// The slots are generous because overflow has to stay correct, not common: a
+    /// turn that outgrows its range falls back to the replica's clock and is stable
+    /// only within that replica.
+    const HEADER_SLOTS: u64 = 64;
+    const TURN_SLOTS: u64 = 64;
+
+    /// The identity of one projected block, derived from its place in the record.
+    fn block_id(author: &str, turn: usize, index: usize, fallback: &mut u64) -> BlockId {
+        let slot = u64::try_from(index).ok();
+        let turn = u64::try_from(turn).ok();
+        match (turn, slot) {
+            (Some(turn), Some(slot)) if slot < Self::TURN_SLOTS => {
+                BlockId::new(Self::HEADER_SLOTS + turn * Self::TURN_SLOTS + slot, author)
+            }
+            _ => {
+                let id = BlockId::new(*fallback, author);
+                *fallback += 1;
+                id
+            }
+        }
+    }
+
     /// The actor a record's blocks are owned by.
     ///
     /// Derived from the harness and the record's own id, so the same record
@@ -383,7 +415,13 @@ impl Transcript {
                     previous = Some(id.clone());
                 }
                 None => {
-                    let id = fresh();
+                    // Header blocks take the low slots, turns start above them.
+                    let id = if u64::try_from(index).is_ok_and(|slot| slot < Self::HEADER_SLOTS)
+                    {
+                        BlockId::new(u64::try_from(index).unwrap_or(0), &author)
+                    } else {
+                        fresh()
+                    };
                     ops.push(Op::Insert {
                         id: id.clone(),
                         after: previous.clone(),
@@ -421,7 +459,7 @@ impl Transcript {
                         previous = Some(id.clone());
                     }
                     None => {
-                        let id = fresh();
+                        let id = Self::block_id(&author, turn, index, &mut next);
                         ops.push(Op::Insert {
                             id: id.clone(),
                             after: previous.clone(),
@@ -1080,6 +1118,75 @@ mod tests {
             model: None,
             extras: None,
         }
+    }
+
+    #[test]
+    fn a_turns_identity_is_its_place_in_the_record() {
+        // Identity is a function of position, not of history: the same turn names
+        // the same block on every replica, however many blocks that replica wrote
+        // before it. Today's chunking happens to number things the same way in the
+        // common case, so this pins the rule rather than repairing a divergence —
+        // the moment a turn renders one block more or less (an extras renderer, a
+        // footer, a truncated import) a counter handed out in sync order renumbers
+        // every turn after it, and two machines then disagree about one record.
+        let mut fallback = 1;
+        let author = "pi:1234abcd";
+        let first = Transcript::block_id(author, 3, 0, &mut fallback);
+        // Same place, asked again with the clock somewhere else entirely.
+        let mut elsewhere = 900;
+        assert_eq!(first, Transcript::block_id(author, 3, 0, &mut elsewhere));
+        // Adjacent places differ, and no turn block can land in the header slots.
+        assert_ne!(first, Transcript::block_id(author, 3, 1, &mut fallback));
+        assert_ne!(first, Transcript::block_id(author, 4, 0, &mut fallback));
+        assert!(first.counter > Transcript::HEADER_SLOTS);
+        // An actor still namespaces it, so two records cannot collide.
+        assert_ne!(first, Transcript::block_id("pi:ffffffff", 3, 0, &mut fallback));
+    }
+
+    #[test]
+    fn two_machines_projecting_one_session_merge_to_one_block_per_turn() {
+        // Two replicas project the same record, one of them from an import that
+        // lost a tool result, then a pull merges both op streams. Whatever the
+        // identity rule, the merge must show one block per turn and not one per
+        // replica.
+        let (temp, mut vfs) = store();
+        let full = session(&mut vfs);
+        let mut incomplete = full.clone();
+        let mut trimmed = false;
+        for turn in &mut incomplete.turns {
+            for tool in &mut turn.tools {
+                if tool.result.take().is_some() {
+                    trimmed = true;
+                    break;
+                }
+            }
+            if trimmed {
+                break;
+            }
+        }
+        assert!(trimmed, "the fixture needs a tool call that had a result");
+
+        let (mut neo, _) = transcript(&vfs, &temp);
+        Transcript::sync(&mut neo, &mut vfs, &incomplete).unwrap();
+
+        // The other machine, projecting the whole record in one pass.
+        let path = temp.path().join("studio.md");
+        let mut studio = DocFile::open(&vfs, "transcript", "studio", &path).unwrap();
+        Transcript::sync(&mut studio, &mut vfs, &full).unwrap();
+
+        // What a pull produces: both op streams, one document.
+        let merged = crate::doc::load(&vfs, "transcript", "neo").unwrap();
+        let headings = merged
+            .order()
+            .into_iter()
+            .filter(|block| !block.deleted && block.text.starts_with("## "))
+            .count();
+        assert_eq!(
+            headings,
+            full.turns.len(),
+            "one block per turn, not one per replica:\n{}",
+            merged.render()
+        );
     }
 
     #[test]
