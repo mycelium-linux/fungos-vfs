@@ -584,7 +584,11 @@ layers, three jobs:
 - `crdt.rs` decides what two replicas agree on. Position is identity (`counter@actor`),
   order comes from `(after, id)` and never from arrival order, a rewrite is an update
   rather than a delete and an insert, and a deletion leaves a tombstone so anything
-  anchored to the block still resolves.
+  anchored to the block still resolves. Two questions are kept apart: **content**
+  merges (character edits carry their own order), while **coverage** — whether a block
+  shows — changes only through a stamped op, so delete and restore are one ordered
+  decision and an edit never quietly resurrects a paragraph somebody removed. The
+  tombstone keeps its text, which is what makes `doc restore` cheap.
 - `doc.rs` binds that to a file: per-actor op streams at `docs/<id>/ops/<actor>.json`,
   a `seen` record so a worktree can tell its own unsaved edits from a view that
   predates a pull, and a snapshot at `docs/<id>/snapshot.md`. Each replica writes only
@@ -601,10 +605,13 @@ cargo run -- --root ~/.local/share/fungos-vfs/notes doc comment --id notes \
 cargo run -- --root ~/.local/share/fungos-vfs/notes doc comment --id notes \
   --thread 1@studio --body "agreed"
 cargo run -- --root ~/.local/share/fungos-vfs/notes doc comments --id notes --path NOTES.md
+cargo run -- --root ~/.local/share/fungos-vfs/notes doc restore --id notes \
+  --path NOTES.md --block 3@neo
 ```
 
 `--block` takes `#N` (the Nth live block) or `counter@actor`; anything recorded should
-use the identity, because a number moves when somebody inserts above it. `doc comments`
+use the identity, because a number moves when somebody inserts above it. `doc restore`
+takes the identity alone — the block it names is the one that is not live. `doc comments`
 prints each thread with its state — `exact`, `clamped`, `neighbour` or `orphan` — because
 a range that no longer fits is reported rather than silently presented as exact.
 
@@ -627,12 +634,18 @@ cargo run -- --root ~/.local/share/fungos-vfs/sessions session project --harness
   --doc transcript --out transcript.md
 ```
 
-The block identities belong to the record (`pi:1a2b3c4d`), not to the machine, so two
-replicas that absorb each other's ops before projecting extend one transcript rather
-than each building its own. One honest limit: a harness appends its record and does not
-rewrite turns it already wrote, so only the last turn is re-projected on each pass. A
-record rewritten in the middle is a full `session project --to markdown` plus
-`doc sync`, and this path does not pretend to notice it.
+The block identities belong to the record, and inside it to the turn: the header's
+second block is `1@pi:1a2b3c4d`, and the second block of the turn the harness calls
+`e5` is `1@pi:1a2b3c4d/e5`. Two replicas that absorb each other's ops before projecting
+therefore extend one transcript rather than each building its own — and a replica whose
+import kept fewer turns still names the turns it kept the same way, which is what stops
+one turn's words landing on another turn's block. Which blocks a turn owns is answered
+by that owner, never by looking for `## ` headings in the layout: a message whose text
+starts with one would otherwise be two turns. One honest limit: a harness appends its
+record and does not rewrite turns it already wrote, so the last turn the document holds
+is re-projected on each pass. A record rewritten in the middle is a full
+`session project --to markdown` plus `doc sync`, and this path does not pretend to
+notice it.
 
 ### A Word file is a container view
 
