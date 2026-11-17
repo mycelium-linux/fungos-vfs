@@ -36,7 +36,7 @@ use base64::Engine as _;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::{BlockId, ContentId, DocFile, Op, Role, Session, Vfs, split_blocks};
+use crate::{BlockId, ContentId, Doc, DocFile, Op, Role, Session, Turn, Vfs, split_blocks};
 
 /// Named in the bundle's `version` field so a reader can tell a projected bundle
 /// from one this machine's own run wrote.
@@ -260,8 +260,8 @@ pub fn to_operator(
 ///
 /// This is the target that needs no target: a transcript is a document, so the
 /// merge layer, the snapshots and git all apply without a line of new machinery.
-/// Each turn is one block — a heading and what happened under it — which is what
-/// makes appending a turn a single insert and re-projecting an unchanged session
+/// Each turn is a heading block with what it said under it, which is what makes
+/// appending a turn a handful of inserts and re-projecting an unchanged session
 /// produce nothing at all.
 pub fn to_markdown(vfs: &Vfs, session: &Session) -> Result<String> {
     let mut parts = vec![header_chunk(session)];
@@ -280,19 +280,26 @@ pub fn to_markdown(vfs: &Vfs, session: &Session) -> Result<String> {
 /// payload in the record to answer "what changed?" when the answer is "one turn
 /// arrived". This walks the same layout and appends:
 ///
-/// - **Identity is positional and owned by the record.** Turn *i*'s blocks are
-///   numbered after the blocks already emitted, and their actor is the record
-///   (`pi:1a2b3c4d`), not the machine. Two replicas that absorb each other's ops
-///   before projecting therefore extend one transcript instead of each building
-///   its own.
+/// - **A block's place is its slot, and its owner is the record and the turn.**
+///   The header's `i`-th block is `i@<record>`; turn `m3f2`'s `j`-th block is
+///   `j@<record>/m3f2`. Identity is a fact about *what the block is*, so two
+///   replicas projecting one record name it the same way however deep either
+///   synced and however many turns either import kept.
+/// - **The turn's own id does the work a position would otherwise do.** A record
+///   that lost a turn on the way in — a message this build could not normalize, a
+///   truncated import — renumbers every turn after it. A counter handed out in
+///   that order names one turn's words as another turn's block, and the merge
+///   then keeps one of them and silently drops the rest.
+/// - **The document is the index, not the layout.** Which blocks belong to turn
+///   `m3f2` is answered by the block's owner. Recovering turn boundaries instead
+///   by looking for `## ` headings makes a turn whose text happens to start like
+///   one — a pasted heading, a quoted diff — into two turns.
 /// - **Only the tail can change.** A harness appends its record; it does not
-///   rewrite a turn it already wrote. So a sync re-projects the last turn it
-///   knows (which may still be growing) and then everything after it. A record
-///   rewritten in the middle is a full [`to_markdown`] plus `doc sync`, and this
-///   type does not pretend to notice it.
-/// - **Turn boundaries are recovered from the layout, not stored.** Every turn
-///   starts with a `## role` block, so which blocks belong to which turn is a
-///   fact about the document, not a cursor somebody has to keep in step.
+///   rewrite a turn it already wrote. A sync re-projects the last turn the
+///   document holds (which may still be growing) and every turn it does not hold
+///   at all, which is also how a gap fills itself in. Everything else is looked up
+///   and left alone. A record rewritten in the middle is a full [`to_markdown`]
+///   plus `doc sync`, and this type does not pretend to notice it.
 pub struct Transcript;
 
 /// What one append did.
@@ -300,7 +307,8 @@ pub struct Transcript;
 pub struct Synced {
     /// Turns in the record, whether or not this pass wrote them.
     pub turns: usize,
-    /// Turns this pass looked at again: the last one it knew, and the new ones.
+    /// Turns this pass read again: the last one the document held, and the ones it
+    /// did not hold at all.
     pub replayed: usize,
     pub inserted: usize,
     pub updated: usize,
@@ -309,37 +317,121 @@ pub struct Synced {
     pub wrote_file: bool,
 }
 
-impl Transcript {
-    /// Counter space a transcript's blocks live in.
-    ///
-    /// A block's identity here is derived from *what it is* — the header, or turn
-    /// `t`'s `j`-th block — and never from how many blocks this replica happened to
-    /// write before it. Handing out counters in sync order makes identity depend on
-    /// history instead: two machines that synced the same session from different
-    /// depths, or that disagree about how many blocks one turn renders because one
-    /// of them imported an incomplete turn, produce different ids for one turn —
-    /// and a merge then shows it twice, or worse, collapses two turns onto one id.
-    ///
-    /// The slots are generous because overflow has to stay correct, not common: a
-    /// turn that outgrows its range falls back to the replica's clock and is stable
-    /// only within that replica.
-    const HEADER_SLOTS: u64 = 64;
-    const TURN_SLOTS: u64 = 64;
+/// One block the document already holds of a record, as a sync needs it.
+struct HeldBlock {
+    id: BlockId,
+    text: String,
+    deleted: bool,
+}
 
-    /// The identity of one projected block, derived from its place in the record.
-    fn block_id(author: &str, turn: usize, index: usize, fallback: &mut u64) -> BlockId {
-        let slot = u64::try_from(index).ok();
-        let turn = u64::try_from(turn).ok();
-        match (turn, slot) {
-            (Some(turn), Some(slot)) if slot < Self::TURN_SLOTS => {
-                BlockId::new(Self::HEADER_SLOTS + turn * Self::TURN_SLOTS + slot, author)
-            }
-            _ => {
-                let id = BlockId::new(*fallback, author);
-                *fallback += 1;
-                id
+/// What a document holds of one record, by the place each block sits: the header
+/// by slot, and each turn by slot under its own name.
+#[derive(Default)]
+struct Held {
+    header: BTreeMap<u64, HeldBlock>,
+    turns: BTreeMap<String, BTreeMap<u64, HeldBlock>>,
+}
+
+impl Held {
+    /// Read a document through one record's eyes.
+    ///
+    /// Tombstones are kept: a slot a delete covered still exists, and re-inserting
+    /// into it is a duplicate that leaves the block invisible for good.
+    fn of(doc: &Doc, author: &str) -> Self {
+        let mut held = Self::default();
+        let prefix = format!("{author}/");
+        for block in doc.order() {
+            let held_block = HeldBlock {
+                id: block.id.clone(),
+                text: block.text.clone(),
+                deleted: block.deleted,
+            };
+            if block.id.actor == author {
+                held.header.insert(block.id.counter, held_block);
+            } else if let Some(turn) = block.id.actor.strip_prefix(&prefix) {
+                held.turns
+                    .entry(turn.to_owned())
+                    .or_default()
+                    .insert(block.id.counter, held_block);
             }
         }
+        held
+    }
+
+    /// One turn's blocks, by slot, when the document holds that turn at all.
+    fn turn(&self, key: &str) -> Option<&BTreeMap<u64, HeldBlock>> {
+        self.turns.get(key)
+    }
+
+    /// The last block of one turn that still shows: what the next turn hangs from.
+    fn tail(&self, key: &str) -> Option<BlockId> {
+        self.turn(key)?
+            .values()
+            .rev()
+            .find(|block| !block.deleted)
+            .map(|block| block.id.clone())
+    }
+}
+
+/// How one slot stands against what the document holds.
+enum Slot {
+    /// Absent, so this is a new block anchored to the one before it.
+    New,
+    /// Present, and saying the same thing.
+    Same,
+    /// Present and different, or covered by a delete. A stamped write replaces
+    /// the text and brings the block back — an insert would be a duplicate, and
+    /// the block would stay invisible.
+    Rewrite,
+}
+
+impl Slot {
+    fn of(held: Option<&HeldBlock>, text: &str) -> Self {
+        match held {
+            None => Self::New,
+            Some(block) if block.deleted => Self::Rewrite,
+            Some(block) if block.text == text => Self::Same,
+            Some(_) => Self::Rewrite,
+        }
+    }
+}
+
+/// A slot as the number that names it. A document with more than `u64::MAX`
+/// blocks in one place is not a document, and no target this builds for has a
+/// `usize` wider than that.
+fn slot_number(slot: usize) -> u64 {
+    u64::try_from(slot).unwrap_or(u64::MAX)
+}
+
+impl Transcript {
+    /// What names one turn inside its record: the harness's own id for the turn,
+    /// and its place in the record only when the harness gave none.
+    ///
+    /// The place is a name of last resort. It is stable across replicas *of the
+    /// same record*, which is all a harness that numbers nothing needs — but a
+    /// record that lost a turn renumbers every turn after it, and then the two
+    /// replicas disagree about which turn a block belongs to.
+    fn turn_key(turn: &Turn) -> String {
+        let id = turn.native_id.trim();
+        if id.is_empty() {
+            format!("#{}", turn.index)
+        } else {
+            id.to_owned()
+        }
+    }
+
+    /// The identity of the header block in `slot`.
+    fn header_id(author: &str, slot: usize) -> BlockId {
+        BlockId::new(slot_number(slot), author)
+    }
+
+    /// The identity of one block of one turn: the slot is the block's place, and
+    /// the owner names the record and the turn.
+    fn turn_id(author: &str, turn: &Turn, slot: usize) -> BlockId {
+        BlockId::new(
+            slot_number(slot),
+            &format!("{author}/{}", Self::turn_key(turn)),
+        )
     }
 
     /// The actor a record's blocks are owned by.
@@ -357,121 +449,106 @@ impl Transcript {
     /// merged text back to the document's file.
     pub fn sync(doc: &mut DocFile, vfs: &mut Vfs, session: &Session) -> Result<Synced> {
         let author = Self::author(session);
-        let emitted: Vec<(BlockId, String)> = doc
-            .doc()
-            .order()
-            .into_iter()
-            .filter(|block| block.id.actor == author && !block.deleted)
-            .map(|block| (block.id.clone(), block.text.clone()))
-            .collect();
-
-        // Turn *t* owns the blocks from the *t*-th `## role` heading to the next
-        // one; everything before the first heading is the header.
-        let mut runs: Vec<Vec<(BlockId, String)>> = Vec::new();
-        let mut header: Vec<(BlockId, String)> = Vec::new();
-        for (id, text) in emitted {
-            if text.starts_with("## ") {
-                runs.push(Vec::new());
-            }
-            match runs.last_mut() {
-                Some(run) => run.push((id, text)),
-                None => header.push((id, text)),
-            }
-        }
-
-        let mut next = doc
-            .doc()
-            .order()
-            .iter()
-            .filter(|block| block.id.actor == author)
-            .map(|block| block.id.counter)
-            .max()
-            .map_or(1, |counter| counter + 1);
-        let mut fresh = || {
-            let id = BlockId::new(next, &author);
-            next += 1;
-            id
-        };
-
+        let held = Held::of(doc.doc(), &author);
         let mut ops: Vec<Op> = Vec::new();
         let mut synced = Synced {
             turns: session.turns.len(),
             ..Synced::default()
         };
+        let mut previous: Option<BlockId> = None;
+
         // The header carries the name, the cwd and the models, and it is cheap to
         // render: it is checked on every pass so a renamed session is corrected.
         let want = split_blocks(&header_chunk(session));
-        let mut previous: Option<BlockId> = None;
-        for (index, text) in want.iter().enumerate() {
-            match header.get(index) {
-                Some((id, have)) if have == text => previous = Some(id.clone()),
-                Some((id, _)) => {
+        for (slot, text) in want.iter().enumerate() {
+            let id = Self::header_id(&author, slot);
+            match Slot::of(held.header.get(&id.counter), text) {
+                Slot::Same => {}
+                Slot::Rewrite => {
                     ops.push(Op::Update {
                         id: id.clone(),
                         text: text.clone(),
                         at: doc.stamp(),
                     });
                     synced.updated += 1;
-                    previous = Some(id.clone());
                 }
-                None => {
-                    // Header blocks take the low slots, turns start above them.
-                    let id = if u64::try_from(index).is_ok_and(|slot| slot < Self::HEADER_SLOTS) {
-                        BlockId::new(u64::try_from(index).unwrap_or(0), &author)
-                    } else {
-                        fresh()
-                    };
+                Slot::New => {
                     ops.push(Op::Insert {
                         id: id.clone(),
                         after: previous.clone(),
                         text: text.clone(),
                     });
                     synced.inserted += 1;
-                    previous = Some(id);
                 }
             }
+            previous = Some(id);
         }
-        for (id, _) in header.iter().skip(want.len()) {
+        let kept = slot_number(want.len());
+        for (slot, block) in &held.header {
+            if *slot < kept || block.deleted {
+                continue;
+            }
             ops.push(Op::Delete {
-                id: id.clone(),
+                id: block.id.clone(),
                 at: doc.stamp(),
             });
             synced.deleted += 1;
         }
 
-        // Re-project the last turn this document knows: it may have grown since.
-        let replay = runs.len().saturating_sub(1);
-        synced.replayed = session.turns.len().saturating_sub(replay);
-        for (turn, source) in session.turns.iter().enumerate().skip(replay) {
-            let want = split_blocks(&turn_chunk(vfs, source)?);
-            let have = runs.get(turn).map_or(&[][..], Vec::as_slice);
-            for (index, text) in want.iter().enumerate() {
-                match have.get(index) {
-                    Some((id, existing)) if existing == text => previous = Some(id.clone()),
-                    Some((id, _)) => {
+        // Which turns the document already holds, in the record's order. Only the
+        // last one it holds can still be growing.
+        let holds: Vec<bool> = session
+            .turns
+            .iter()
+            .map(|turn| held.turn(&Self::turn_key(turn)).is_some())
+            .collect();
+        let growing = holds.iter().rposition(|holds| *holds);
+        for (index, turn) in session.turns.iter().enumerate() {
+            let key = Self::turn_key(turn);
+            let stored = held.turn(&key);
+            if holds[index] && Some(index) != growing {
+                if let Some(tail) = held.tail(&key) {
+                    previous = Some(tail);
+                }
+                continue;
+            }
+
+            let want = split_blocks(&turn_chunk(vfs, turn)?);
+            synced.replayed += 1;
+            for (slot, text) in want.iter().enumerate() {
+                let id = Self::turn_id(&author, turn, slot);
+                match Slot::of(stored.and_then(|slots| slots.get(&id.counter)), text) {
+                    Slot::Same => {}
+                    Slot::Rewrite => {
                         ops.push(Op::Update {
                             id: id.clone(),
                             text: text.clone(),
                             at: doc.stamp(),
                         });
                         synced.updated += 1;
-                        previous = Some(id.clone());
                     }
-                    None => {
-                        let id = Self::block_id(&author, turn, index, &mut next);
+                    Slot::New => {
                         ops.push(Op::Insert {
                             id: id.clone(),
                             after: previous.clone(),
                             text: text.clone(),
                         });
                         synced.inserted += 1;
-                        previous = Some(id);
                     }
                 }
+                previous = Some(id);
             }
-            for (id, _) in have.iter().skip(want.len()) {
+            // A turn that shrank — a tool result the harness withdrew, a model
+            // that stopped mid-sentence — leaves slots behind it that nothing will
+            // fill. They are covered rather than removed, so the turn keeps its
+            // place and a restore can still name them.
+            let kept = slot_number(want.len());
+            for (slot, block) in stored.into_iter().flatten() {
+                if *slot < kept || block.deleted {
+                    continue;
+                }
                 ops.push(Op::Delete {
-                    id: id.clone(),
+                    id: block.id.clone(),
                     at: doc.stamp(),
                 });
                 synced.deleted += 1;
@@ -1120,29 +1197,81 @@ mod tests {
     }
 
     #[test]
-    fn a_turns_identity_is_its_place_in_the_record() {
-        // Identity is a function of position, not of history: the same turn names
-        // the same block on every replica, however many blocks that replica wrote
-        // before it. Today's chunking happens to number things the same way in the
-        // common case, so this pins the rule rather than repairing a divergence —
-        // the moment a turn renders one block more or less (an extras renderer, a
-        // footer, a truncated import) a counter handed out in sync order renumbers
-        // every turn after it, and two machines then disagree about one record.
-        let mut fallback = 1;
+    fn a_turn_names_its_blocks_and_not_its_place_in_the_record() {
+        // Identity is a fact about *what* a block is — the record, the turn, the
+        // slot — so two replicas that disagree about how many turns came before,
+        // or about how many blocks an earlier turn rendered, still name one turn
+        // the same way. A counter handed out in sync order fails exactly here.
         let author = "pi:1234abcd";
-        let first = Transcript::block_id(author, 3, 0, &mut fallback);
-        // Same place, asked again with the clock somewhere else entirely.
-        let mut elsewhere = 900;
-        assert_eq!(first, Transcript::block_id(author, 3, 0, &mut elsewhere));
-        // Adjacent places differ, and no turn block can land in the header slots.
-        assert_ne!(first, Transcript::block_id(author, 3, 1, &mut fallback));
-        assert_ne!(first, Transcript::block_id(author, 4, 0, &mut fallback));
-        assert!(first.counter > Transcript::HEADER_SLOTS);
-        // An actor still namespaces it, so two records cannot collide.
+        let first = turn(3, Role::User, None);
+        let id = Transcript::turn_id(author, &first, 0);
+
+        // Same turn, somewhere else in the record: the harness id travels with it.
+        let moved = Turn {
+            index: 11,
+            ..turn(3, Role::User, None)
+        };
+        assert_eq!(id, Transcript::turn_id(author, &moved, 0));
+
+        // A different slot, a different turn, a different record: all different.
+        assert_ne!(id, Transcript::turn_id(author, &first, 1));
         assert_ne!(
-            first,
-            Transcript::block_id("pi:ffffffff", 3, 0, &mut fallback)
+            id,
+            Transcript::turn_id(author, &turn(4, Role::User, None), 0)
         );
+        assert_ne!(id, Transcript::turn_id("pi:ffffffff", &first, 0));
+        assert_ne!(Transcript::header_id(author, 0), id);
+
+        // A turn with no id of its own falls back to its place, which still keeps
+        // two of them apart.
+        let nameless = |index: u32| Turn {
+            native_id: String::new(),
+            ..turn(index, Role::User, None)
+        };
+        assert_ne!(
+            Transcript::turn_id(author, &nameless(2), 0),
+            Transcript::turn_id(author, &nameless(3), 0)
+        );
+
+        // And the identity survives the form a person types.
+        assert_eq!(id.to_string().parse::<BlockId>().unwrap(), id);
+    }
+
+    #[test]
+    fn a_record_that_lost_a_turn_does_not_renumber_the_others() {
+        // The failure the keyed identity exists for. `neo` imports a record that
+        // dropped a message — a harness record this build could not normalize —
+        // and every turn after it sits one place earlier. Numbered by place, its
+        // turns land on the blocks of the turns that are missing; the merge keeps
+        // the headings it already had and the words underneath them are gone.
+        let (temp, mut vfs) = store();
+        let full = session(&mut vfs);
+        let mut truncated = full.clone();
+        truncated.turns.remove(1);
+
+        let (mut neo, _) = transcript(&vfs, &temp);
+        Transcript::sync(&mut neo, &mut vfs, &truncated).unwrap();
+
+        // The other machine projects the whole record.
+        let path = temp.path().join("studio.md");
+        let mut studio = DocFile::open(&vfs, "transcript", "studio", &path).unwrap();
+        Transcript::sync(&mut studio, &mut vfs, &full).unwrap();
+
+        let merged = crate::doc::load(&vfs, "transcript", "neo").unwrap();
+        let text = merged.render();
+        for said in ["read the readme", "reading it", "boom"] {
+            assert_eq!(
+                text.matches(said).count(),
+                1,
+                "every turn said its piece exactly once: {text}"
+            );
+        }
+        let headings = merged
+            .order()
+            .into_iter()
+            .filter(|block| !block.deleted && block.text.starts_with("## "))
+            .count();
+        assert_eq!(headings, full.turns.len(), "one heading per turn: {text}");
     }
 
     #[test]
@@ -1257,6 +1386,34 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             to_markdown(&vfs, &session).unwrap(),
             "the appended document is the rendered one"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_shrank_gets_its_block_back_when_it_grows_again() {
+        // The slot survives the delete, so coming back is a stamped write, not an
+        // insert: an insert on an id the document already holds is a duplicate,
+        // and the text would stay invisible for the rest of the document's life.
+        let (temp, mut vfs) = store();
+        let mut session = session(&mut vfs);
+        let (mut doc, _path) = transcript(&vfs, &temp);
+        Transcript::sync(&mut doc, &mut vfs, &session).unwrap();
+
+        let last = session.turns.len() - 1;
+        let said = session.turns[last].text.take().expect("the turn spoke");
+        let shrank = Transcript::sync(&mut doc, &mut vfs, &session).unwrap();
+        assert_eq!(shrank.deleted, 1, "the block it lost is covered");
+        assert_eq!(shrank.inserted + shrank.updated, 0);
+        assert!(!doc.render().contains("boom"));
+
+        session.turns[last].text = Some(said);
+        let grew = Transcript::sync(&mut doc, &mut vfs, &session).unwrap();
+        assert_eq!(grew.inserted, 0, "nothing new: the slot was already there");
+        assert_eq!(grew.updated, 1, "the covered block came back");
+        assert!(
+            doc.render().contains("boom"),
+            "the turn says what it said again: {}",
+            doc.render()
         );
     }
 
