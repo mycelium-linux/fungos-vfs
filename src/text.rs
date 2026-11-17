@@ -189,10 +189,10 @@ impl Text {
                 if self.nodes.contains_key(id) {
                     return TextApplied::Duplicate;
                 }
-                if let Some(after) = after {
-                    if !self.nodes.contains_key(after) {
-                        return TextApplied::Deferred;
-                    }
+                if let Some(after) = after
+                    && !self.nodes.contains_key(after)
+                {
+                    return TextApplied::Deferred;
                 }
                 self.nodes.insert(
                     id.clone(),
