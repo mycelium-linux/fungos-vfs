@@ -1504,8 +1504,19 @@ fn ssh_command() -> std::process::Command {
 }
 
 /// Quote one argument for the remote shell.
+///
+/// Single quotes around the value, and an embedded quote closed, escaped and
+/// reopened — `'it'\''s'` is the whole of the POSIX rule, and a shell reads it
+/// back as one word. The value is not otherwise escaped, because inside single
+/// quotes there is nothing to escape.
+///
+/// This was `'''{}'''`: three quotes on each side. A shell concatenates the
+/// pieces, so `ssh` itself was fine — but anything that reads the command string
+/// without being a shell (a forced-command guard, which is exactly what a
+/// restricted key needs) saw the quotes as part of the path.
+#[must_use]
 fn shell_quote(value: &str) -> String {
-    format!("'''{}'''", value.replace('\'', "'\''"))
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1556,6 +1567,27 @@ mod tests {
 
     /// The carrier only moves bytes: everything that matters has to survive
     /// being serialised, because that is what crosses the wire.
+    #[test]
+    fn a_quoted_argument_round_trips_through_a_shell_in_one_layer() {
+        // `ssh` hands the remote a command line, and the remote shell splits it —
+        // but a restricted key puts a forced command in front, and that guard is
+        // not a shell. It has to be able to take the quoting off, so there is one
+        // layer of it and no more.
+        use std::process::Command;
+
+        assert_eq!(shell_quote("/srv/fungos"), "'/srv/fungos'");
+        for value in ["/srv/fungos", "/home/me/some root/vfs", "/tmp/it's here"] {
+            let quoted = shell_quote(value);
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s' {quoted}"))
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            assert_eq!(String::from_utf8_lossy(&out.stdout), value, "{quoted}");
+        }
+    }
+
     #[test]
     fn a_request_and_response_survive_the_wire() {
         let dir = tempfile::tempdir().unwrap();
