@@ -16,16 +16,29 @@
 //! - **Deletion leaves a tombstone.** A removed block keeps its place in the tree
 //!   so the blocks after it stay anchored, and so an annotation pointing at it can
 //!   resolve to a neighbour instead of dangling. Coverage is a rendering
-//!   decision; the record keeps the fact.
+//!   decision; the record keeps the fact — and it keeps the text too, which is
+//!   what makes [`Op::Restore`] possible at all.
 //!
-//! What is deliberately not here: character-level merging inside a block. Two
-//! edits to one block resolve last-writer-wins by `(counter, actor)`, visibly and
-//! deterministically, until a text CRDT replaces that rule. The interface is
-//! built so it can: a block's content is replaced, never patched, by this module.
+//! Two different questions, answered by two different rules, and mixing them up is
+//! how a merge loses somebody's work:
+//!
+//! - **Content merges.** Character edits carry their own order (see [`crate::text`]),
+//!   so two replicas editing different parts of one paragraph both keep their
+//!   words. A [`Op::Update`] replaces the lot; a [`Op::Edit`] never loses a
+//!   character that arrived first.
+//! - **Coverage is stamped.** Whether a block *shows* changes only through a
+//!   stamped op — insert, update, delete, restore — and the latest stamp wins.
+//!   An edit is content, not a decision about coverage: it merges into a block
+//!   somebody else deleted, and stays invisible until a restore reveals it. The
+//!   alternative (an edit resurrects a block) makes a delete impossible to
+//!   complete against anyone who has the paragraph on screen, and hides the fact
+//!   that the delete was ignored.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+
+use crate::text::{Text, TextOp};
 
 /// Who an edit is attributed to. The actor is part of every identity, so two
 /// machines generate the same counter without colliding.
@@ -90,8 +103,26 @@ pub enum Op {
         text: String,
         at: BlockId,
     },
-    /// A block removed. It stays in the tree as a tombstone.
+    /// A block's content edited character by character.
+    ///
+    /// This is what a save emits now: [`crate::text`] merges the characters, so two
+    /// replicas editing different parts of one paragraph both keep their edit
+    /// instead of one winning the whole block. `Update` remains as the wholesale
+    /// replacement — a projector re-rendering a turn, an import that found no
+    /// shared base — and it clears the character state, because a block whose text
+    /// was replaced has no characters in common with what it was.
+    Edit { id: BlockId, ops: Vec<TextOp> },
+    /// A block removed. It stays in the tree as a tombstone, with its text.
     Delete { id: BlockId, at: BlockId },
+    /// A tombstoned block brought back, at the place it kept.
+    ///
+    /// The other half of [`Op::Delete`]: the two are the coverage ops, and they
+    /// are stamped, so the later one wins. Content is not part of the decision —
+    /// a covered block keeps its characters, so a restore shows what the block
+    /// said when it went away, including anything that merged into it meanwhile.
+    /// A delete this restore did not see, but later in the record, covers it
+    /// again; that is the same rule read backwards.
+    Restore { id: BlockId, at: BlockId },
 }
 
 /// One block as a replica holds it.
@@ -103,6 +134,13 @@ pub struct Block {
     pub text: String,
     /// The stamp of the last write to `text`.
     pub revision: BlockId,
+    /// The block's text as characters with identities, so an edit merges inside a
+    /// paragraph instead of replacing it. Empty on a block written by a build that
+    /// predates it, and seeded from `text` the first time an edit arrives — the
+    /// seed is derived from the block's identity, so every replica seeds the same
+    /// characters.
+    #[serde(default, skip_serializing_if = "Text::is_empty")]
+    pub chars: Text,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deleted: bool,
 }
@@ -178,6 +216,7 @@ impl Doc {
                     Block {
                         id: id.clone(),
                         after: after.clone(),
+                        chars: Text::seeded(id, text),
                         text: text.clone(),
                         revision: id.clone(),
                         deleted: false,
@@ -194,11 +233,39 @@ impl Doc {
                     return Applied::Duplicate;
                 }
                 block.text.clone_from(text);
-                // A write that wins is a write: it also brings a block back if the
-                // side it is racing deleted it. Last writer wins, including deletes.
+                // Replaced wholesale: the characters it had are not the characters
+                // it has, so the next edit seeds from the new text rather than
+                // merging into a stale sequence.
+                block.chars = Text::seeded(id, text);
+                // A stamped write is also a coverage decision: a block somebody
+                // deleted and somebody else rewrote shows the rewrite, because the
+                // stamp that is later in the record is the one a person meant.
                 block.deleted = false;
                 block.revision = at.clone();
                 Applied::Applied
+            }
+            Op::Edit { id, ops } => {
+                let Some(block) = self.blocks.get_mut(id) else {
+                    return Applied::Deferred;
+                };
+                if block.chars.is_empty() {
+                    block.chars = Text::seeded(id, &block.text);
+                }
+                // Character ops carry their own order, so there is no stamp to
+                // compare and nothing to lose: this merges, it does not win. It is
+                // also content and not coverage — the characters land whether or
+                // not the block currently shows, so a restore brings them back
+                // rather than a paragraph that has been rolled back.
+                let deferred = block.chars.apply_all(ops);
+                block.text = block.chars.render();
+                if deferred.is_empty() {
+                    Applied::Applied
+                } else {
+                    // Anchored to a character this replica has not seen. The op is
+                    // retried when the rest of the stream arrives, and applying it
+                    // twice is a duplicate.
+                    Applied::Deferred
+                }
             }
             Op::Delete { id, at } => {
                 self.observe(at.counter);
@@ -209,6 +276,18 @@ impl Doc {
                     return Applied::Duplicate;
                 }
                 block.deleted = true;
+                block.revision = at.clone();
+                Applied::Applied
+            }
+            Op::Restore { id, at } => {
+                self.observe(at.counter);
+                let Some(block) = self.blocks.get_mut(id) else {
+                    return Applied::Deferred;
+                };
+                if block.revision >= *at || !block.deleted {
+                    return Applied::Duplicate;
+                }
+                block.deleted = false;
                 block.revision = at.clone();
                 Applied::Applied
             }
@@ -231,13 +310,19 @@ impl Doc {
     pub fn apply_all(&mut self, ops: &[Op]) -> Vec<Op> {
         let mut pending: Vec<&Op> = ops.iter().collect();
         loop {
+            // The size of *this* pass, not of the batch that started it: an op that
+            // lands leaves the retry list shorter, and comparing against the
+            // original length means a pass that defers everything it was given can
+            // never look finished. That was an infinite loop, reached by any pull
+            // that resumed holding only ops whose block had not arrived yet.
+            let count = pending.len();
             let mut deferred = Vec::new();
             for op in pending {
                 if self.apply(op) == Applied::Deferred {
                     deferred.push(op);
                 }
             }
-            if deferred.is_empty() || deferred.len() == ops.len() {
+            if deferred.is_empty() || deferred.len() == count {
                 return deferred.into_iter().cloned().collect();
             }
             pending = deferred;
@@ -332,6 +417,29 @@ impl Doc {
         self.len() == 0
     }
 
+    /// The ops that turn one block's text into another's, character by character.
+    ///
+    /// A rewritten paragraph is a few inserted and deleted characters, not a new
+    /// paragraph: that is what lets two replicas that edited different sentences of
+    /// it both keep their sentence. `None` when the text did not change.
+    fn edit(&mut self, id: &BlockId, have: &str, want: &str) -> Option<Op> {
+        let (start, removed, inserted) = Text::difference(have, want);
+        if removed == 0 && inserted.is_empty() {
+            return None;
+        }
+        let mut text = self
+            .blocks
+            .get(id)
+            .map(|block| block.chars.clone())
+            .filter(|chars| !chars.is_empty())
+            .unwrap_or_else(|| Text::seeded(id, have));
+        let ops = text.splice(start, removed, &inserted, &mut || self.tick());
+        Some(Op::Edit {
+            id: id.clone(),
+            ops,
+        })
+    }
+
     /// Turn a file's contents into ops, against what this replica already holds.
     ///
     /// This is the seam that lets a plain editor — or an agent's `write` tool — be
@@ -371,12 +479,13 @@ impl Doc {
             let mut old_index = old_cursor;
             let mut new_index = new_cursor;
             while old_index < old_match && new_index < new_match {
-                let at = self.tick();
-                ops.push(Op::Update {
-                    id: current[old_index].0.clone(),
-                    text: incoming[new_index].clone(),
-                    at,
-                });
+                if let Some(edit) = self.edit(
+                    &current[old_index].0,
+                    &current[old_index].1,
+                    &incoming[new_index],
+                ) {
+                    ops.push(edit);
+                }
                 last_placed = Some(current[old_index].0.clone());
                 old_index += 1;
                 new_index += 1;
@@ -546,6 +655,34 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_whose_remaining_ops_all_defer_terminates() {
+        // A pull can resume mid-stream, so a batch may arrive holding only ops that
+        // wait on a block the next pull carries. Every op that lands shortens the
+        // retry list; when a whole pass lands nothing, the rest is waiting on a
+        // block that is not here and the batch is done.
+        let mut doc = Doc::new("neo");
+        let batch = vec![
+            Op::Update {
+                id: BlockId::new(99, "ghost"),
+                text: "never lands".to_owned(),
+                at: BlockId::new(100, "ghost"),
+            },
+            Op::Delete {
+                id: BlockId::new(98, "ghost"),
+                at: BlockId::new(101, "ghost"),
+            },
+            Op::Insert {
+                id: BlockId::new(1, "neo"),
+                after: None,
+                text: "here".to_owned(),
+            },
+        ];
+        let deferred = doc.apply_all(&batch);
+        assert_eq!(deferred.len(), 2, "only the insert could land");
+        assert_eq!(doc.render(), "here");
+    }
+
+    #[test]
     fn an_unchanged_file_produces_no_ops() {
         let mut doc = Doc::new("neo");
         let ops = doc.import(BASE);
@@ -566,7 +703,11 @@ mod tests {
 
         let ops = doc.import(&BASE.replace("first", "the first"));
         assert_eq!(ops.len(), 1, "one rewrite, not a delete plus an insert");
-        assert!(matches!(ops[0], Op::Update { .. }));
+        assert!(
+            matches!(ops[0], Op::Edit { .. }),
+            "a save is characters, not a whole-block replacement: {:?}",
+            ops[0]
+        );
         doc.apply_all(&ops);
 
         assert_eq!(doc.live()[1].id, before);
@@ -586,9 +727,37 @@ mod tests {
     }
 
     #[test]
-    fn two_edits_to_one_block_resolve_by_stamp() {
-        // Inside a block the rule is last-writer-wins until a text CRDT replaces
-        // it. What matters now is that both replicas pick the same winner.
+    fn two_edits_inside_one_block_both_survive() {
+        // The rule this replaces: inside a block, last writer won and one edit was
+        // lost. Now the characters merge, so a person on each machine keeps what
+        // they typed even when both touched the same paragraph.
+        let mut neo = Doc::new("neo");
+        let base = neo.import(BASE);
+        neo.apply_all(&base);
+        let mut studio = replica("studio", &base);
+
+        let neo_ops = neo.import(&BASE.replace("first", "NEO"));
+        neo.apply_all(&neo_ops);
+        // A different sentence of the same block, not the same word.
+        let studio_ops = studio.import(&BASE.replace("second", "STUDIO"));
+        studio.apply_all(&studio_ops);
+
+        neo.apply_all(&studio_ops);
+        studio.apply_all(&neo_ops);
+
+        assert_eq!(neo.render(), studio.render());
+        let text = neo.render();
+        assert!(text.contains("NEO"), "the first edit survived: {text}");
+        assert!(text.contains("STUDIO"), "the second edit survived: {text}");
+        assert_eq!(neo.len(), 3, "still one block per paragraph");
+    }
+
+    #[test]
+    fn the_same_word_edited_twice_leaves_both_versions_visible() {
+        // The honest edge of a character CRDT: two people typing over the *same*
+        // characters do not overwrite each other, they concatenate. That is a
+        // different outcome from last-writer-wins, not a better one, and it has to
+        // be stated so nobody reads it as a lost edit.
         let mut neo = Doc::new("neo");
         let base = neo.import(BASE);
         neo.apply_all(&base);
@@ -598,17 +767,15 @@ mod tests {
         neo.apply_all(&neo_ops);
         let studio_ops = studio.import(&BASE.replace("first", "STUDIO"));
         studio.apply_all(&studio_ops);
-
         neo.apply_all(&studio_ops);
         studio.apply_all(&neo_ops);
 
-        assert_eq!(neo.render(), studio.render());
+        assert_eq!(neo.render(), studio.render(), "both replicas agree");
         let text = neo.render();
         assert!(
-            text.contains("NEO") ^ text.contains("STUDIO"),
-            "exactly one side wins the block: {text}"
+            text.contains("NEO") && text.contains("STUDIO"),
+            "concurrent replacement of one word keeps both: {text}"
         );
-        assert!(!text.contains("first paragraph"));
     }
 
     #[test]
@@ -684,5 +851,120 @@ mod tests {
             at: BlockId::new(3, "studio"),
         });
         assert_eq!(deleted.render(), "back");
+    }
+
+    #[test]
+    fn a_restore_brings_back_what_the_block_said_in_the_place_it_kept() {
+        let mut doc = Doc::new("neo");
+        let base = doc.import("a\n\nb\n\nc");
+        doc.apply_all(&base);
+        let b = doc.live()[1].id.clone();
+        let at = doc.stamp();
+        doc.apply(&Op::Delete { id: b.clone(), at });
+        assert_eq!(doc.render(), "a\n\nc");
+
+        let at = doc.stamp();
+        doc.apply(&Op::Restore { id: b.clone(), at });
+        assert_eq!(
+            doc.render(),
+            "a\n\nb\n\nc",
+            "the tombstone kept the block's place, so the restore has its text \
+             and its neighbours already"
+        );
+        assert!(!doc.block(&b).expect("restored").deleted);
+    }
+
+    #[test]
+    fn words_typed_into_a_deleted_block_are_kept_for_the_restore() {
+        // The policy, stated as a test: coverage and content are separate
+        // questions. `neo` removes the paragraph; `studio`, which has not seen the
+        // delete, types into it. The delete stands — that is the decision — but the
+        // typing is not thrown away with it.
+        let mut neo = Doc::new("neo");
+        let base = neo.import(BASE);
+        neo.apply_all(&base);
+        let mut studio = replica("studio", &base);
+
+        let delete_ops = neo.import(&BASE.replace("\n\nfirst paragraph", ""));
+        neo.apply_all(&delete_ops);
+        let edit_ops = studio.import(&BASE.replace("first", "the first"));
+        studio.apply_all(&edit_ops);
+
+        neo.apply_all(&edit_ops);
+        studio.apply_all(&delete_ops);
+        assert_eq!(neo.render(), studio.render(), "the replicas agree");
+        assert!(
+            !neo.render().contains("first paragraph"),
+            "the delete is not undone by a concurrent edit: {}",
+            neo.render()
+        );
+
+        let buried = neo
+            .order()
+            .into_iter()
+            .find(|block| block.deleted && block.text.contains("first paragraph"))
+            .map(|block| block.id.clone())
+            .expect("the tombstone is still in the record");
+        let at = neo.stamp();
+        neo.apply(&Op::Restore {
+            id: buried.clone(),
+            at: at.clone(),
+        });
+        studio.apply(&Op::Restore {
+            id: buried.clone(),
+            at: at.clone(),
+        });
+        assert!(
+            neo.render().contains("the first paragraph"),
+            "the restore shows what the paragraph said when it went away: {}",
+            neo.render()
+        );
+        assert_eq!(neo.render(), studio.render());
+    }
+
+    #[test]
+    fn a_delete_after_a_restore_covers_the_block_again() {
+        // Same rule read backwards: whichever of the two coverage ops is later in
+        // the record is the one people meant.
+        let id = BlockId::new(1, "neo");
+        let mut doc = Doc::new("neo");
+        doc.apply(&Op::Insert {
+            id: id.clone(),
+            after: None,
+            text: "here".to_owned(),
+        });
+        doc.apply(&Op::Delete {
+            id: id.clone(),
+            at: BlockId::new(2, "neo"),
+        });
+        doc.apply(&Op::Restore {
+            id: id.clone(),
+            at: BlockId::new(3, "studio"),
+        });
+        assert_eq!(doc.render(), "here");
+
+        doc.apply(&Op::Delete {
+            id,
+            at: BlockId::new(4, "studio"),
+        });
+        assert_eq!(doc.render(), "", "a later delete covers it again");
+    }
+
+    #[test]
+    fn a_restore_of_a_live_block_is_a_duplicate_not_a_second_copy() {
+        let id = BlockId::new(1, "neo");
+        let mut doc = Doc::new("neo");
+        doc.apply(&Op::Insert {
+            id: id.clone(),
+            after: None,
+            text: "here".to_owned(),
+        });
+        let restore = Op::Restore {
+            id,
+            at: BlockId::new(2, "studio"),
+        };
+        assert_eq!(doc.apply(&restore), Applied::Duplicate);
+        assert_eq!(doc.apply(&restore), Applied::Duplicate, "and stays one");
+        assert_eq!(doc.render(), "here");
     }
 }

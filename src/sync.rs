@@ -95,6 +95,12 @@ impl SyncCursor {
             .map(|(origin, hlc)| (origin.as_str(), *hlc))
     }
 
+    /// Whether this peer has seen nothing at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
     /// Whether `op` is already covered by this cursor.
     pub fn covers(&self, op: &crate::SyncOp) -> bool {
         self.get(&op.store).is_some_and(|hlc| hlc >= op.hlc)
@@ -151,6 +157,17 @@ pub struct SyncRequest {
     /// this field keeps getting what it always got.
     #[serde(default = "wants_content")]
     pub content: bool,
+    /// Whether the requester holds nothing and wants this store's state rather
+    /// than a delta of it.
+    ///
+    /// An empty cursor cannot say this. [`answer_sync`](crate::Vfs::answer_sync)
+    /// reads an empty cursor as "start at the beginning of the log", and the log
+    /// is not the namespace, so a store whose writes were all acknowledged answers
+    /// such a peer with nothing and the peer stays empty. The requester is the
+    /// only side that knows it is new. Defaults to `false` so a peer that has
+    /// never heard of this field gets what it always got.
+    #[serde(default)]
+    pub state: bool,
 }
 
 impl SyncRequest {
@@ -160,6 +177,16 @@ impl SyncRequest {
             cursor,
             limit,
             content: true,
+            state: false,
+        }
+    }
+
+    /// A request for the state itself: what a peer that holds nothing asks for.
+    #[must_use]
+    pub fn state(cursor: SyncCursor, limit: usize) -> Self {
+        Self {
+            state: true,
+            ..Self::new(cursor, limit)
         }
     }
 }
@@ -447,7 +474,11 @@ impl Vfs {
                 request.version
             )));
         }
-        let batch = self.answer_sync(&request.cursor, request.limit)?;
+        let batch = if request.state {
+            self.answer_state()?
+        } else {
+            self.answer_sync(&request.cursor, request.limit)?
+        };
         self.pack_content(batch, request.content)
     }
 
@@ -609,6 +640,8 @@ impl Vfs {
 
     /// Build the answer to a peer's request: the ops it lacks, and which of
     /// their content ids this store cannot supply either.
+    /// The ops a peer lacks, or the state itself when the log can no longer reach
+    /// it.
     pub fn answer_sync(
         &mut self,
         cursor: &SyncCursor,
@@ -620,21 +653,7 @@ impl Vfs {
         // truth, so it gets the state itself instead. `limit` does not apply:
         // a snapshot is not a page, it is the answer.
         if behind_horizon(cursor, &self.horizons()?) {
-            let snapshot = self.snapshot()?;
-            let mut missing_content = Vec::new();
-            for entry in &snapshot.entries {
-                let Some(content_id) = &entry.content_id else {
-                    continue;
-                };
-                if !self.has_content(content_id)? {
-                    missing_content.push(content_id.clone());
-                }
-            }
-            return Ok(SyncBatch {
-                ops: Vec::new(),
-                missing_content,
-                snapshot: Some(snapshot),
-            });
+            return self.answer_state();
         }
         let ops = self.ops_after(cursor, limit)?;
         let mut missing_content = Vec::new();
@@ -650,6 +669,34 @@ impl Vfs {
             ops,
             missing_content,
             snapshot: None,
+        })
+    }
+
+    /// Everything this store holds, as state rather than as ops.
+    ///
+    /// This is what a peer that holds nothing has to be given. An empty cursor
+    /// cannot ask for it: [`ops_after`](Self::ops_after) reads an empty cursor as
+    /// "start at the beginning of the log", and the log is not the namespace —
+    /// the queue only holds writes no peer has acknowledged, and a root populated
+    /// by an ingest or a migration never queued anything at all. Such a store
+    /// would answer with an empty batch, which the peer cannot tell from being
+    /// current; it would stay empty and report success. That is also the only way
+    /// a machine joining with a desktop already on it ever catches up.
+    pub fn answer_state(&self) -> Result<SyncBatch, VfsError> {
+        let snapshot = self.snapshot()?;
+        let mut missing_content = Vec::new();
+        for entry in &snapshot.entries {
+            let Some(content_id) = &entry.content_id else {
+                continue;
+            };
+            if !self.has_content(content_id)? {
+                missing_content.push(content_id.clone());
+            }
+        }
+        Ok(SyncBatch {
+            ops: Vec::new(),
+            missing_content,
+            snapshot: Some(snapshot),
         })
     }
 
@@ -978,7 +1025,17 @@ impl Vfs {
     /// has moved on.
     pub fn snapshot(&self) -> Result<Snapshot, VfsError> {
         let tx = self.db.unchecked_transaction()?;
-        let watermark = self.sync_cursor()?;
+        let mut watermark = self.sync_cursor()?;
+        // The state is a reading of this store even when it holds no log at all.
+        // The receiver adopts the watermark as its horizon, so an empty one would
+        // leave it new again on its next pull and it would ask for the whole state
+        // every time. Zero is the honest reading for a store with nothing to name —
+        // and the safe one: a reading fabricated from the clock could sit above an
+        // op written in the same millisecond, and every op at or below a watermark
+        // is one the receiver is told it need not be sent.
+        if watermark.is_empty() {
+            watermark.observe(self.store(), Hlc::default());
+        }
         let mut entries = Vec::new();
         let mut statement = self
             .db
@@ -1352,7 +1409,15 @@ pub fn pull_over_ssh(
     want_content: bool,
     limit: usize,
 ) -> Result<(Vec<ApplyOutcome>, TransferReport), VfsError> {
-    let mut request = SyncRequest::new(vfs.sync_cursor()?, limit);
+    let cursor = vfs.sync_cursor()?;
+    // A store that holds nothing asks for the state: an empty cursor would
+    // otherwise be read as "the whole log", which a store whose writes were all
+    // acknowledged answers with nothing at all.
+    let mut request = if cursor.is_empty() {
+        SyncRequest::state(cursor, limit)
+    } else {
+        SyncRequest::new(cursor, limit)
+    };
     request.content = want_content;
     // The peer opens its root in the role that root was created with, and the
     // two ends do not have to agree: a full store pulling from a laptop's cache
@@ -1439,8 +1504,19 @@ fn ssh_command() -> std::process::Command {
 }
 
 /// Quote one argument for the remote shell.
+///
+/// Single quotes around the value, and an embedded quote closed, escaped and
+/// reopened — `'it'\''s'` is the whole of the POSIX rule, and a shell reads it
+/// back as one word. The value is not otherwise escaped, because inside single
+/// quotes there is nothing to escape.
+///
+/// This was `'''{}'''`: three quotes on each side. A shell concatenates the
+/// pieces, so `ssh` itself was fine — but anything that reads the command string
+/// without being a shell (a forced-command guard, which is exactly what a
+/// restricted key needs) saw the quotes as part of the path.
+#[must_use]
 fn shell_quote(value: &str) -> String {
-    format!("'''{}'''", value.replace('\'', "'\''"))
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1492,6 +1568,27 @@ mod tests {
     /// The carrier only moves bytes: everything that matters has to survive
     /// being serialised, because that is what crosses the wire.
     #[test]
+    fn a_quoted_argument_round_trips_through_a_shell_in_one_layer() {
+        // `ssh` hands the remote a command line, and the remote shell splits it —
+        // but a restricted key puts a forced command in front, and that guard is
+        // not a shell. It has to be able to take the quoting off, so there is one
+        // layer of it and no more.
+        use std::process::Command;
+
+        assert_eq!(shell_quote("/srv/fungos"), "'/srv/fungos'");
+        for value in ["/srv/fungos", "/home/me/some root/vfs", "/tmp/it's here"] {
+            let quoted = shell_quote(value);
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s' {quoted}"))
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            assert_eq!(String::from_utf8_lossy(&out.stdout), value, "{quoted}");
+        }
+    }
+
+    #[test]
     fn a_request_and_response_survive_the_wire() {
         let dir = tempfile::tempdir().unwrap();
         let (mut a, mut b) = pair(dir.path());
@@ -1519,6 +1616,42 @@ mod tests {
         let request = SyncRequest::new(b.sync_cursor().unwrap(), 100);
         let response = a.serve_sync(&request).unwrap();
         assert!(response.ops.is_empty());
+    }
+
+    #[test]
+    fn a_peer_that_holds_nothing_is_given_the_state_not_an_empty_delta() {
+        // The case a desktop on another machine runs into: a root whose writes were
+        // all acknowledged is a root with an empty log and a full namespace. Asked
+        // for a delta it answers with nothing, and the new peer cannot tell that
+        // from being up to date — it would stay empty and report success.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = pair(dir.path());
+        a.put("notes/one.md", b"one", "text/markdown", Expect::Any)
+            .unwrap();
+        a.put("notes/two.md", b"two", "text/markdown", Expect::Any)
+            .unwrap();
+        let queued: Vec<i64> = a.pending(100).unwrap().iter().map(|op| op.id).collect();
+        a.ack(&queued).unwrap();
+        assert!(a.pending(100).unwrap().is_empty(), "nothing left to send");
+
+        let delta = a
+            .serve_sync(&SyncRequest::new(b.sync_cursor().unwrap(), 100))
+            .unwrap();
+        assert!(
+            delta.ops.is_empty() && delta.snapshot.is_none(),
+            "an empty log answers a delta with nothing"
+        );
+
+        let state = a
+            .serve_sync(&SyncRequest::state(b.sync_cursor().unwrap(), 100))
+            .unwrap();
+        assert_eq!(b.apply_sync(&state).unwrap(), vec![ApplyOutcome::Snapshot]);
+        assert_eq!(b.get("notes/one.md").unwrap(), b"one");
+        assert_eq!(b.get("notes/two.md").unwrap(), b"two");
+        assert!(
+            !b.sync_cursor().unwrap().is_empty(),
+            "taking the state is a reading: every later answer can be a delta"
+        );
     }
 
     #[test]

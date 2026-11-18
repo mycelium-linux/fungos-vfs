@@ -27,6 +27,7 @@ mod session;
 mod store;
 mod stream;
 mod sync;
+mod text;
 mod transfer;
 mod vfs;
 mod worktree;
@@ -71,6 +72,7 @@ pub use sync::{
     SnapshotEntry, SnapshotKind, SnapshotStaging, SyncBatch, SyncCursor, SyncRequest, SyncResponse,
     TransferReport, pull_over_ssh,
 };
+pub use text::{CharId, Text, TextApplied, TextOp};
 pub use transfer::{
     ExportReport, GitPointer, IngestReport, SourceMode, export_dir, ingest_dir,
     ingest_dir_with_policy,

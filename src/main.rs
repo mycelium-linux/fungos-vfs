@@ -362,7 +362,7 @@ enum Command {
     /// A markdown file and the document it is a view of: read the file's edits,
     /// merge them, and write the result back.
     Doc {
-        /// `sync`, `comment`, or `comments`.
+        /// `sync`, `restore`, `comment`, `comments`, `import`, or `view`.
         mode: String,
         /// The document's identity. Two files with one id are one document.
         #[arg(long)]
@@ -1380,6 +1380,37 @@ fn run() -> anyhow::Result<()> {
                             ""
                         }
                     );
+                }
+            }
+            "restore" => {
+                let id = id.ok_or_else(|| anyhow::anyhow!("doc restore needs --id"))?;
+                let view = path.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "doc restore needs --path: the view to write the block back into"
+                    )
+                })?;
+                // A removed block has no `#N`: the number names live blocks, and
+                // the whole point is that this one is not live. Identity or
+                // nothing, which is also what an undo has in hand.
+                let spec = block.ok_or_else(|| {
+                    anyhow::anyhow!("doc restore needs --block counter@actor, the removed block")
+                })?;
+                let buried: BlockId = spec.parse().map_err(anyhow::Error::msg)?;
+                let actor = actor.unwrap_or_else(|| vfs.writer().actor.clone());
+                let mut doc = DocFile::open(&vfs, &id, &actor, &view)?;
+                doc.restore(&mut vfs, &buried)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "document": id,
+                            "path": view,
+                            "restored": buried,
+                            "snapshot": doc.snapshot(&vfs)?,
+                        }))?
+                    );
+                } else {
+                    println!("{buried}\trestored\t{}", view.display());
                 }
             }
             "comment" => {

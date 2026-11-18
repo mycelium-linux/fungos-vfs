@@ -197,6 +197,33 @@ impl DocFile {
         self.commit(vfs, ops, &current)
     }
 
+    /// Bring a removed block back, at the place it kept.
+    ///
+    /// Deletion never destroyed anything — the tombstone holds the text and its
+    /// neighbours — so a restore is one op against the record, not a re-import of
+    /// the file. It is stamped like any other write, so a delete later in the
+    /// record than this restore covers the block again: the two are one ordered
+    /// decision, and this module does not get a second opinion on it.
+    ///
+    /// Refuses a block the document does not hold, and one that is not covered: a
+    /// restore of something already on screen means the caller has lost track of
+    /// the document, and reporting success would keep it lost.
+    pub fn restore(&mut self, vfs: &mut Vfs, id: &BlockId) -> Result<Op> {
+        match self.doc.block(id) {
+            None => anyhow::bail!("{} holds no block {id}", self.id),
+            Some(block) if !block.deleted => {
+                anyhow::bail!("{id} is not deleted; there is nothing to restore")
+            }
+            Some(_) => {}
+        }
+        let op = Op::Restore {
+            id: id.clone(),
+            at: self.stamp(),
+        };
+        self.extend(vfs, vec![op.clone()])?;
+        Ok(op)
+    }
+
     /// Apply `ops`, publish this replica's stream, and write the merged text.
     fn commit(&mut self, vfs: &mut Vfs, ops: Vec<Op>, current: &str) -> Result<Reconciled> {
         let report_ops = ops.len();
@@ -509,6 +536,49 @@ mod tests {
         // Both sides committed, and each commit is a readable snapshot.
         assert!(run(&a, &["log", "--oneline"]).lines().count() >= 2);
         assert!(run(&b, &["log", "--oneline"]).lines().count() >= 2);
+    }
+
+    #[test]
+    fn a_deleted_paragraph_comes_back_where_it_was_and_reaches_the_other_worktree() {
+        let (temp, mut vfs) = store();
+        let file = temp.path().join("NOTES.md");
+        fs::write(&file, format!("{BASE}\n")).unwrap();
+        let mut doc = DocFile::open(&vfs, "notes", "neo", &file).unwrap();
+        doc.reconcile(&mut vfs).unwrap();
+
+        // A person deletes the middle paragraph in their editor.
+        let without = BASE.replace("\n\nfirst paragraph", "");
+        fs::write(&file, format!("{without}\n")).unwrap();
+        doc.reconcile(&mut vfs).unwrap();
+        assert!(!doc.render().contains("first paragraph"));
+        let buried = doc
+            .doc()
+            .order()
+            .into_iter()
+            .find(|block| block.deleted)
+            .map(|block| block.id.clone())
+            .expect("the paragraph is a tombstone, not a hole");
+
+        let op = doc.restore(&mut vfs, &buried).unwrap();
+        assert!(
+            matches!(op, Op::Restore { .. }),
+            "a restore is one op, not a re-import"
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            format!("{BASE}\n"),
+            "the paragraph is back where it was"
+        );
+
+        // The other worktree has never seen this file: it gets the document.
+        let other = temp.path().join("other.md");
+        let mut studio = DocFile::open(&vfs, "notes", "studio", &other).unwrap();
+        studio.reconcile(&mut vfs).unwrap();
+        assert_eq!(fs::read_to_string(&other).unwrap(), format!("{BASE}\n"));
+
+        // Restoring what is already visible is a caller that lost track.
+        let error = doc.restore(&mut vfs, &buried).unwrap_err().to_string();
+        assert!(error.contains("not deleted"), "{error}");
     }
 
     #[test]

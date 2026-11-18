@@ -85,6 +85,10 @@ pub struct StreamRequest {
     /// Where to continue an interrupted snapshot, when there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<Resume>,
+    /// Whether the requester holds nothing and wants the state rather than a
+    /// delta. See [`crate::SyncRequest::state`].
+    #[serde(default)]
+    pub state: bool,
 }
 
 /// A point a snapshot transfer can continue from.
@@ -264,12 +268,17 @@ pub struct PullClient {
 
 impl PullClient {
     pub fn new(cursor: SyncCursor, limit: usize) -> Self {
+        // A store that holds nothing asks for the state: an empty cursor would
+        // otherwise be read as "the whole log", and a store whose writes were all
+        // acknowledged has no log to offer.
+        let state = cursor.is_empty();
         Self {
             request: StreamRequest {
                 version: STREAM_VERSION,
                 cursor,
                 limit,
                 resume: None,
+                state,
             },
             session: None,
             staging: None,
@@ -487,7 +496,11 @@ where
             ),
         ));
     }
-    let batch = vfs.answer_sync(&request.cursor, request.limit)?;
+    let batch = if request.state {
+        vfs.answer_state()?
+    } else {
+        vfs.answer_sync(&request.cursor, request.limit)?
+    };
     let mut bytes = read;
 
     let Some(snapshot) = batch.snapshot else {
@@ -799,6 +812,16 @@ mod tests {
         a.put("notes/one.md", b"one", "text/markdown", Expect::Any)
             .unwrap();
 
+        // The peer takes the state first: that is what a store holding nothing is
+        // answered with, and it is where a real one starts.
+        let mut client = PullClient::new(b.sync_cursor().unwrap(), 100);
+        let (_, pulled) =
+            runtime().block_on(exchange(&mut a, &mut client, &mut b, MAX_FRAME, None));
+        assert_eq!(pulled.unwrap(), vec![ApplyOutcome::Snapshot]);
+
+        // Now it holds a reading, so the next answer is the delta after it.
+        a.put("notes/two.md", b"two", "text/markdown", Expect::Any)
+            .unwrap();
         let mut client = PullClient::new(b.sync_cursor().unwrap(), 100);
         let (served, pulled) =
             runtime().block_on(exchange(&mut a, &mut client, &mut b, MAX_FRAME, None));
@@ -809,7 +832,7 @@ mod tests {
             client.report().session.is_none(),
             "a delta inside retention is not a session"
         );
-        assert_eq!(b.get("notes/one.md").unwrap(), b"one");
+        assert_eq!(b.get("notes/two.md").unwrap(), b"two");
     }
 
     #[test]
@@ -1082,6 +1105,7 @@ mod tests {
                 cursor: SyncCursor::new(),
                 limit: 10,
                 resume: None,
+                state: false,
             };
             let body = serde_json::to_vec(&request).unwrap();
             write_frame(&mut client_io, MAX_FRAME, KIND_REQUEST, &body)
