@@ -510,7 +510,12 @@ mod tests {
     use super::*;
     use crate::stream::Cut;
     use crate::{Expect, Hlc, NodeRole, Vfs};
-    use std::{path::Path, thread};
+    use std::{
+        path::Path,
+        sync::{Arc, Mutex},
+        thread,
+        time::Instant,
+    };
 
     /// Port zero: the kernel picks one, so tests never collide.
     const LOOPBACK: &str = "127.0.0.1:0";
@@ -533,8 +538,18 @@ mod tests {
     struct Peer {
         addr: SocketAddr,
         fingerprint: String,
-        handle: thread::JoinHandle<Vec<String>>,
+        /// How many connections the test expects, which is how long `join` waits.
+        expected: usize,
+        served: Arc<Mutex<usize>>,
+        failures: Arc<Mutex<Vec<String>>>,
     }
+
+    /// How many connections beyond the expected ones a test server will answer.
+    ///
+    /// A transfer that is cut is resumed on a fresh connection, so "two pulls" is
+    /// not always two connections, and a budget that is *exactly* the expected
+    /// count turns a retry into a 30-second timeout instead of a slower test.
+    const SPARE_SESSIONS: usize = 4;
 
     impl Peer {
         fn start(server: SyncServer, vfs: Vfs, sessions: usize) -> Self {
@@ -552,20 +567,25 @@ mod tests {
         ) -> Self {
             let addr = server.local_addr().unwrap();
             let fingerprint = server.fingerprint();
-            let handle = thread::spawn(move || {
-                let mut failures = Vec::new();
-                for session in 0..sessions {
+            let failures = Arc::new(Mutex::new(Vec::new()));
+            let served = Arc::new(Mutex::new(0usize));
+            let log = Arc::clone(&failures);
+            let count = Arc::clone(&served);
+            thread::spawn(move || {
+                for session in 0..sessions + SPARE_SESSIONS {
                     if let Err(error) = server.accept_one(&mut vfs) {
-                        failures.push(error.to_string());
+                        log.lock().expect("failure log").push(error.to_string());
                     }
+                    *count.lock().expect("session count") = session + 1;
                     between(session + 1, &mut vfs);
                 }
-                failures
             });
             Self {
                 addr,
                 fingerprint,
-                handle,
+                expected: sessions,
+                served,
+                failures,
             }
         }
 
@@ -574,8 +594,18 @@ mod tests {
         }
 
         /// Sessions the server refused, which is empty for a well-behaved peer.
+        ///
+        /// Waits only for the connections the test asked for: past those the
+        /// thread is left answering a spare one that may never come, because a
+        /// resumed transfer is not a failure and must not be a hang either.
         fn join(self) -> Vec<String> {
-            self.handle.join().expect("server thread panicked")
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while *self.served.lock().expect("session count") < self.expected
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            self.failures.lock().expect("failure log").clone()
         }
     }
 
@@ -606,9 +636,12 @@ mod tests {
 
         let (outcomes, report) =
             pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
-        assert_eq!(outcomes, vec![ApplyOutcome::Applied; 2]);
+        // A peer that holds nothing is handed the state rather than a delta: an
+        // empty cursor is a question the op log cannot answer, which is the whole
+        // reason a machine can join with a store that has already been written to.
+        assert_eq!(outcomes, vec![ApplyOutcome::Snapshot]);
         assert_eq!(report.entries, 2);
-        assert!(report.session.is_none(), "a delta is not a session");
+        assert!(report.session.is_some(), "the state names its session");
         assert_eq!(b.get("notes/one.md").unwrap(), b"one");
         assert_eq!(b.get("notes/two.md").unwrap(), b"two");
 
@@ -642,11 +675,11 @@ mod tests {
             },
         );
 
-        // b sees one write, so its cursor is a real reading that the compaction
-        // can leave behind — an empty cursor was simply never caught up.
+        // b takes the state, so its cursor is a real reading — a watermark the
+        // compaction that follows can leave behind.
         let (outcomes, _) =
             pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
-        assert_eq!(outcomes, vec![ApplyOutcome::Applied]);
+        assert_eq!(outcomes, vec![ApplyOutcome::Snapshot]);
 
         // The delta b would get starts after the hole and looks complete, so it
         // is told the log cannot reach it and handed the state instead.
@@ -740,7 +773,7 @@ mod tests {
         // b learns the seed first, so the compaction can leave it behind.
         let (outcomes, _) =
             pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
-        assert_eq!(outcomes, vec![ApplyOutcome::Applied]);
+        assert_eq!(outcomes, vec![ApplyOutcome::Snapshot]);
 
         let (outcomes, report) = pull(
             &mut b,
@@ -813,7 +846,7 @@ mod tests {
 
         let (outcomes, _) =
             pull_over_quic(&mut b, &peer.endpoint(), &peer.fingerprint, 100).unwrap();
-        assert_eq!(outcomes, vec![ApplyOutcome::Applied]);
+        assert_eq!(outcomes, vec![ApplyOutcome::Snapshot]);
         let before = serde_json::to_string(&b.list("").unwrap()).unwrap();
 
         let target: SocketAddr = peer.endpoint().parse().unwrap();

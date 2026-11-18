@@ -138,9 +138,12 @@ with `checkout` — `replaced: 2`, eight files untouched.
   unresolved state instead. This is the deliberate difference from a
   last-writer-wins layer: a filesystem that silently picks a winner loses an
   edit, and the person who lost it is never told.
-- **`snapshot`** — this store had fallen behind a compaction horizon, so it was
-  handed the live namespace at a watermark rather than a delta it could not
-  recognise as short.
+- **`snapshot`** — the state itself, at a watermark, instead of a delta. Two cases,
+  one answer: this store had fallen behind a compaction horizon, so a delta could
+  not reach it and would look complete anyway; or it held nothing at all, because
+  an empty cursor cannot be told apart from one that is up to date. The second is
+  what lets a machine join with a store that has already been written to — point a
+  new root at a desktop and its first pull is that desktop.
 
 Content follows the ops: an op names content ids this store may not hold, and
 the bytes are fetched by id and verified against it before being stored.
