@@ -70,7 +70,7 @@ pub use stream::{MAX_FRAME, PullClient, Resume, STREAM_VERSION, SnapshotHeader, 
 pub use sync::{
     ApplyOutcome, CompactionReport, ContentBlob, Divergence, MESSAGE_VERSION, SessionId, Snapshot,
     SnapshotEntry, SnapshotKind, SnapshotStaging, SyncBatch, SyncCursor, SyncRequest, SyncResponse,
-    TransferReport, pull_over_ssh,
+    TransferReport, pull_over_ssh, request_pull,
 };
 pub use text::{CharId, Text, TextApplied, TextOp};
 pub use transfer::{

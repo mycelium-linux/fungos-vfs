@@ -1970,6 +1970,19 @@ impl Vfs {
     /// change to that worktree, and a worktree's record is still that worktree's
     /// even if a path moved out from under it. An empty prefix with an empty
     /// worktree asks for everything.
+    /// The newest change-feed row, or zero when nothing has been recorded.
+    ///
+    /// A watcher starts from here so a restart does not replay every write this
+    /// store has ever made. Change rows are host-local: they say what happened
+    /// here, not what a peer still has to be told.
+    pub fn latest_change_id(&self) -> Result<i64, VfsError> {
+        self.db
+            .query_row("SELECT COALESCE(MAX(id),0) FROM changes", [], |row| {
+                row.get(0)
+            })
+            .map_err(VfsError::from)
+    }
+
     pub fn changes(
         &self,
         since: i64,

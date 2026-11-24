@@ -1479,6 +1479,62 @@ pub fn pull_over_ssh(
     Ok((outcomes, report))
 }
 
+/// Ask a peer to pull from this store.
+///
+/// This is the notification half of a live exchange. A watcher on this machine
+/// sees a local write, then sends the peer the command that makes the peer pull
+/// the new ops and content. The peer needs no listener: `ssh` carries the
+/// request, and the pull itself runs there with this store as its remote.
+///
+/// It is deliberately a *pull*, not a push. The peer still decides what it
+/// accepts and still reports divergence; the sender has only said that there is
+/// something new to ask for.
+pub fn request_pull(
+    remote: &str,
+    remote_root: &str,
+    remote_bin: &str,
+    local_remote: &str,
+    local_root: &str,
+    local_bin: &str,
+) -> Result<String, VfsError> {
+    let command = peer_pull_command(remote_root, remote_bin, local_remote, local_root, local_bin);
+    let output = ssh_command()
+        .arg(remote)
+        .arg(&command)
+        .output()
+        .map_err(|error| VfsError::Transport(format!("ssh {remote}: {error}")))?;
+    if !output.status.success() {
+        return Err(VfsError::Transport(format!(
+            "{remote} could not pull: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The command `request_pull` runs on the peer.
+///
+/// Every path is quoted once, for the one shell that will read it. The remote
+/// binary is quoted too: it is usually an absolute path under a home directory,
+/// and a space in that path must not turn into two arguments.
+#[must_use]
+fn peer_pull_command(
+    remote_root: &str,
+    remote_bin: &str,
+    local_remote: &str,
+    local_root: &str,
+    local_bin: &str,
+) -> String {
+    format!(
+        "{} --root {} sync pull --remote {} --remote-root {} --remote-bin {}",
+        shell_quote(remote_bin),
+        shell_quote(remote_root),
+        shell_quote(local_remote),
+        shell_quote(local_root),
+        shell_quote(local_bin)
+    )
+}
+
 /// The carrier that reaches a peer, when it is not plain `ssh`.
 ///
 /// `FUNGOS_VFS_SSH` names it -- the same idea as bob's `BOB_SSH` -- because a
@@ -1497,7 +1553,9 @@ fn ssh_command() -> std::process::Command {
         }
         _ => {
             let mut command = std::process::Command::new("ssh");
-            command.args(["-o", "BatchMode=yes"]);
+            // A watcher must not sit on a peer that is asleep for minutes: the
+            // retry is only useful if a failed notification comes back quickly.
+            command.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
             command
         }
     }
@@ -1586,6 +1644,23 @@ mod tests {
             assert!(out.status.success());
             assert_eq!(String::from_utf8_lossy(&out.stdout), value, "{quoted}");
         }
+    }
+
+    #[test]
+    fn a_peer_is_told_to_pull_from_this_store_once() {
+        let command = peer_pull_command(
+            "/Users/me/fungos root",
+            "/Users/me/.local/bin/fungos-vfs",
+            "averys-mac-studio",
+            "/Users/me/.local/share/fungos/vfs",
+            "/Users/me/.local/bin/fungos-vfs",
+        );
+        assert_eq!(
+            command,
+            "'/Users/me/.local/bin/fungos-vfs' --root '/Users/me/fungos root' sync pull \
+             --remote 'averys-mac-studio' --remote-root '/Users/me/.local/share/fungos/vfs' \
+             --remote-bin '/Users/me/.local/bin/fungos-vfs'"
+        );
     }
 
     #[test]
