@@ -192,10 +192,33 @@ at the moment of refusal) instead of a log that no one can compact.
 The report says which happened: `expired_divergences` per store, and `pinned`
 for the ones still holding the pass back.
 
+### Watching: tell the peer to pull
+
+`sync watch` closes most of the gap between a write and the next pull without
+turning the protocol into a push. It reads this store's change feed, waits for
+the burst to settle, then runs one command on the peer:
+
+```sh
+fungos-vfs --root ~/fungos-local sync watch \
+  --remote agora-one \
+  --remote-root /home/ajmwagar/fungos \
+  --local-remote averys-mac-studio
+```
+
+The peer runs `sync pull` against this store, so it still decides what to accept
+and still reports divergence. A periodic notification is sent even when nothing
+changed here, which is the retry for a peer that was asleep or a message that
+was lost. `--local-remote` is how the peer reaches this machine over ssh; it
+defaults to this host's name.
+
+This is the first live-sync slice, not a persistent control connection. It uses
+the existing ssh carrier and leaves `sync serve` unchanged. A QUIC/iroh control
+channel, content hints, and peer discovery are the next layer.
+
 ### What sync is not
 
-- **Not push.** Nothing watches the filesystem, so convergence happens when a
-  pull runs. A live-sync daemon is future work.
+- **Not push.** `sync watch` tells a peer that there is something to pull; the
+  peer still runs the pull. Nothing blindly writes into another store.
 - **Not a merge.** Concurrent writes to the same path surface as `diverged` for
   a human to settle. Neither side wins automatically; the version that lost is
   kept as a copy so the decision can be made by reading both.

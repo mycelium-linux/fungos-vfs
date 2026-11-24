@@ -3,6 +3,7 @@ use std::{
     fs,
     io::Write,
     path::PathBuf,
+    time::{Duration, Instant},
 };
 
 use clap::{Parser, Subcommand};
@@ -11,8 +12,8 @@ use fungos_vfs::{
     Expect, Hydration, NodeRole, PathPolicy, RecordOptions, ReplicaConfig, ReplicaSpec, SourceMode,
     SyncServer, Transcript, Vfs, attach_project, checkout, export_dir, import_pi,
     import_pi_incremental, ingest_dir_with_policy, list_projects, load_doc, materialize,
-    migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, to_markdown, to_operator,
-    worktree_changes, worktrees,
+    migrate_storage_with_cas, pull_over_quic, pull_over_ssh, record, request_pull, to_markdown,
+    to_operator, worktree_changes, worktrees,
 };
 
 #[derive(Parser)]
@@ -172,8 +173,9 @@ enum Command {
     },
     /// Exchange ops with a peer store.
     Sync {
-        /// `serve` answers a request on stdin; `pull` asks a peer; `compact`
-        /// drops log rows a peer can no longer be caught up from.
+        /// `serve` answers a request on stdin; `pull` asks a peer; `watch`
+        /// tells a peer to pull after local writes; `compact` drops log rows a
+        /// peer can no longer be caught up from.
         mode: String,
         /// ssh destination for `pull`, e.g. `agora-one`.
         #[arg(long)]
@@ -219,6 +221,21 @@ enum Command {
         /// Which peer's divergence to settle, when several hold the same path.
         #[arg(long)]
         store: Option<String>,
+        /// `watch`: how the peer reaches this machine over ssh. Defaults to this
+        /// host's name, which works when both ends resolve each other.
+        #[arg(long)]
+        local_remote: Option<String>,
+        /// `watch`: how often to look for local changes, in milliseconds.
+        #[arg(long, default_value_t = 1000)]
+        poll_ms: u64,
+        /// `watch`: how long to wait after the last local change before telling
+        /// the peer there is something to pull, in milliseconds.
+        #[arg(long, default_value_t = 750)]
+        debounce_ms: u64,
+        /// `watch`: notify even when nothing changed here, so a missed message
+        /// or a peer that was offline still converges, in milliseconds.
+        #[arg(long, default_value_t = 60_000)]
+        retry_ms: u64,
     },
     /// Materialize everything under `prefix` into a directory.
     Export {
@@ -665,6 +682,10 @@ fn run() -> anyhow::Result<()> {
             path,
             keep,
             store,
+            local_remote,
+            poll_ms,
+            debounce_ms,
+            retry_ms,
         } => match mode.as_str() {
             // ssh stays the default carrier: without `--quic`, `serve` answers
             // one request on stdin, which is exactly what an ssh session gives
@@ -700,6 +721,85 @@ fn run() -> anyhow::Result<()> {
                     let request: fungos_vfs::SyncRequest = serde_json::from_str(&input)?;
                     let response = vfs.serve_sync(&request)?;
                     println!("{}", serde_json::to_string(&response)?);
+                }
+            }
+            "watch" => {
+                let remote = remote
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("sync watch needs --remote"))?;
+                let remote_root = remote_root
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("sync watch needs --remote-root"))?;
+                let local_remote = local_remote.unwrap_or_else(|| vfs.writer().origin.clone());
+                let local_bin = std::env::current_exe()?.display().to_string();
+                let local_root = vfs.root().display().to_string();
+                let mut cursor = vfs.latest_change_id()?;
+                let retry = Duration::from_millis(retry_ms.max(1_000));
+                let mut last_notify = Instant::now();
+                eprintln!(
+                    "watching {} for local writes; {} will pull from {} ({})",
+                    vfs.root().display(),
+                    remote,
+                    local_remote,
+                    local_root
+                );
+                loop {
+                    let changes = vfs.changes(cursor, "", "", 256)?;
+                    let mut local_write = false;
+                    for change in &changes {
+                        cursor = cursor.max(change.id);
+                        // A peer's op also lands in the change feed. Notifying
+                        // somebody about a write they just sent us would be a
+                        // loop, so only writes attributed to this machine count.
+                        local_write |= change.origin == vfs.writer().origin;
+                    }
+                    // The retry is the safety net Resilio gets from a live
+                    // connection: a notification can be lost while a peer is
+                    // asleep, and the next one must still get there eventually.
+                    if !local_write && last_notify.elapsed() < retry {
+                        std::thread::sleep(Duration::from_millis(poll_ms.max(50)));
+                        continue;
+                    }
+                    if local_write {
+                        std::thread::sleep(Duration::from_millis(debounce_ms));
+                    }
+                    // Drain what landed during the debounce so one notification
+                    // covers a burst rather than one per file.
+                    loop {
+                        let more = vfs.changes(cursor, "", "", 256)?;
+                        let Some(last) = more.last() else {
+                            break;
+                        };
+                        for change in &more {
+                            local_write |= change.origin == vfs.writer().origin;
+                        }
+                        cursor = cursor.max(last.id);
+                        if more.len() < 256 {
+                            break;
+                        }
+                    }
+                    if !local_write && last_notify.elapsed() < retry {
+                        continue;
+                    }
+                    match request_pull(
+                        remote,
+                        remote_root,
+                        &remote_bin,
+                        &local_remote,
+                        &local_root,
+                        &local_bin,
+                    ) {
+                        Ok(report) => println!(
+                            "{}",
+                            serde_json::json!({
+                                "peer": remote,
+                                "triggered": true,
+                                "report": report,
+                            })
+                        ),
+                        Err(error) => eprintln!("sync watch: {error}"),
+                    }
+                    last_notify = Instant::now();
                 }
             }
             "pull" => {
@@ -776,7 +876,7 @@ fn run() -> anyhow::Result<()> {
                 );
             }
             other => anyhow::bail!(
-                "sync mode must be serve, pull, compact, diverged or resolve, not {other}"
+                "sync mode must be serve, pull, watch, compact, diverged or resolve, not {other}"
             ),
         },
         Command::Export { prefix, dest } => {
