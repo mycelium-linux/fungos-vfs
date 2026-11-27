@@ -1236,6 +1236,17 @@ impl Vfs {
         self.file(&path)?.ok_or_else(|| VfsError::NotFound(path))
     }
 
+    /// Whether the content-addressed bytes for `content_id` are physically
+    /// present. `file()` describes the namespace; this describes the store.
+    pub(crate) fn has_blob(&self, content_id: &ContentId) -> bool {
+        self.blobs.has(content_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blob_path_for_test(&self, content_id: &ContentId) -> PathBuf {
+        self.blobs.path_for(content_id)
+    }
+
     pub fn get(&mut self, path: &str) -> Result<Vec<u8>, VfsError> {
         let path = normalize_path(path)?;
         let entry = self.file(&path)?.ok_or_else(|| VfsError::NotFound(path))?;
